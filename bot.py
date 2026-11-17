@@ -2,9 +2,8 @@ import os
 import time
 import logging
 import asyncio
-from threading import Thread
 from flask import Flask
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from pymongo import MongoClient
 
@@ -13,27 +12,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# 1. SERVIDOR WEB CON FLASK (Para Render)
-# ==========================================
-app_flask = Flask(__name__)
-
-@app_flask.route('/')
-def home():
-    return "🤖 Black Renowned Bot está activo y funcionando perfectamente."
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app_flask.run(host="0.0.0.0", port=port)
-
-# ==========================================
-# 2. CONFIGURACIÓN DE CREDENCIALES Y PYROGRAM
+# 1. CONFIGURACIÓN DE CREDENCIALES Y PYROGRAM
 # ==========================================
 API_ID = int(os.getenv("API_ID", "123456"))
 API_HASH = os.getenv("API_HASH", "tu_api_hash")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "tu_token_bot")
 MONGO_URI = os.getenv("MONGO_URI", "tu_uri_mongodb")
 
-# Inicializar cliente de Pyrogram con in_memory=True (Solución definitiva para la nube)
+# Inicializar cliente de Pyrogram en memoria
 app = Client(
     "BlackRenownedBot",
     api_id=API_ID,
@@ -48,7 +34,7 @@ db = mongo_client["BlackRenownedDB"]
 users_collection = db["users_state"]
 
 # ==========================================
-# 3. MENÚ PRINCIPAL Y /START
+# 2. MENÚ PRINCIPAL Y /START
 # ==========================================
 @app.on_message(filters.command("start") | filters.command("restart"))
 async def start_command(client: Client, message: Message):
@@ -77,7 +63,7 @@ async def start_command(client: Client, message: Message):
     await message.reply_text(welcome_text, reply_markup=keyboard)
 
 # ==========================================
-# 4. GESTOR DE BOTONES (CALLBACK QUERY)
+# 3. GESTOR DE BOTONES (CALLBACK QUERY)
 # ==========================================
 @app.on_callback_query()
 async def callback_handler(client: Client, callback_query: CallbackQuery):
@@ -118,7 +104,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         )
 
 # ==========================================
-# 5. MANEJADOR DE ARCHIVOS CON BARRA DINÁMICA
+# 4. MANEJADOR DE ARCHIVOS CON BARRA DINÁMICA
 # ==========================================
 @app.on_message(filters.document | filters.photo)
 async def handle_files(client: Client, message: Message):
@@ -157,17 +143,26 @@ async def handle_files(client: Client, message: Message):
     await status_msg.edit_reply_markup(reply_markup=finish_keyboard)
 
 # ==========================================
-# ARRANQUE ESTABLE (Flask daemon + Pyrogram Idle)
+# 5. SERVIDOR WEB FLASK INTEGRADO EN HILO
+# ==========================================
+app_flask = Flask(__name__)
+
+@app_flask.route('/')
+def home():
+    return "🤖 Black Renowned Bot está activo y funcionando perfectamente."
+
+from threading import Thread
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app_flask.run(host="0.0.0.0", port=port, use_reloader=False)
+
+# ==========================================
+# ARRANQUE OFICIAL NATIVO DE PYROGRAM
 # ==========================================
 if __name__ == "__main__":
-    logger.info("🌐 Iniciando servidor web Flask en hilo secundario...")
+    logger.info("🌐 Iniciando servidor web Flask en segundo plano...")
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    logger.info("🤖 Iniciando cliente de Pyrogram en memoria...")
-    app.start()
-    logger.info("✨ ¡Bot conectado de forma estable y listo!")
-    
-    idle()
-    
-    app.stop()
+    logger.info("🤖 Iniciando Bot de Telegram con Pyrogram nativo...")
+    app.run()
