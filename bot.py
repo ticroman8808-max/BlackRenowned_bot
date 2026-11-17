@@ -30,7 +30,7 @@ def run_flask():
 # ==========================================
 API_ID = int(os.getenv("API_ID", "123456"))
 API_HASH = os.getenv("API_HASH", "tu_api_hash")
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "tu_token_bot")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "tu_token_bot")
 MONGO_URI = os.getenv("MONGO_URI", "tu_uri_mongodb")
 
 # Inicializar cliente de Pyrogram
@@ -126,42 +126,5 @@ async def handle_files(client: Client, message: Message):
     steps = [
         (25, "25.0 MB / 100.2 MB", "00:08 s", "📥 Descargando..."),
         (60, "60.1 MB / 100.2 MB", "00:05 s", "⚙️ Aplicando nombre y metadatos..."),
-        (90, "95.4 MB / 100.2 MB", "00:01 s", "🖼️ Empaquetando archivo final..."),
-        (100, "100.2 MB / 100.2 MB", "¡Completado!", "✨ ¡Archivo procesado con éxito!")
-    ]
-    
-    for percent, mb_info, time_info, status_desc in steps:
-        completed = int(percent / 10)
-        remaining = 10 - completed
-        bar = "█" * completed + "░" * remaining
-        
-        progress_text = (
-            f"⏳ **Procesando tu pedido...**\n\n"
-            f"[{bar}] {percent}%\n\n"
-            f"📦 **Tamaño:** {mb_info}\n"
-            f"⏱️ **Tiempo restante:** {time_info}\n"
-            f"🔹 **Estado:** {status_desc}"
-        )
-        try:
-            await status_msg.edit_text(progress_text)
-        except Exception:
-            pass
-        
-        await asyncio.sleep(1)
+        (90, "95.4 MB / 100.2 MB", "0
 
-    finish_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Descargar Archivo", callback_data="download_ready")],
-        [InlineKeyboardButton("🏠 Menú Principal", callback_data="main_menu")]
-    ])
-    await status_msg.edit_reply_markup(reply_markup=finish_keyboard)
-
-# ==========================================
-# ARRANQUE SIMULTÁNEO (Flask + Pyrogram)
-# ==========================================
-if __name__ == "__main__":
-    logger.info("🌐 Iniciando servidor web Flask...")
-    flask_thread = Thread(target=run_flask)
-    flask_thread.start()
-    
-    logger.info("🤖 Iniciando Black Renowned Bot con Pyrogram...")
-    app.run()
