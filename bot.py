@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-import asyncio
+from threading import Thread
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
@@ -19,7 +19,7 @@ API_HASH = os.getenv("API_HASH", "tu_api_hash")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "tu_token_bot")
 MONGO_URI = os.getenv("MONGO_URI", "tu_uri_mongodb")
 
-# Cliente de Pyrogram optimizado en memoria
+# Inicializar cliente de Pyrogram
 app = Client(
     "BlackRenownedBot",
     api_id=API_ID,
@@ -143,33 +143,35 @@ async def handle_files(client: Client, message: Message):
     await status_msg.edit_reply_markup(reply_markup=finish_keyboard)
 
 # ==========================================
-# 5. SERVIDOR WEB NATIVO ASÍNCRONO (AIOHTTP para Render)
+# 5. SERVIDOR WEB AIOHTTP EN HILO SECUNDARIO
 # ==========================================
 async def handle_web(request):
     return web.Response(text="🤖 Black Renowned Bot está activo y funcionando perfectamente.")
 
-async def start_web_server():
-    server = web.Server(handle_web)
-    runner = web.ServerRunner(server)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"🌐 Servidor web aiohttp corriendo en el puerto {port}")
+def run_web_server():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def start_server():
+        app_web = web.Application()
+        app_web.router.add_get("/", handle_web)
+        runner = web.AppRunner(app_web)
+        await runner.setup()
+        port = int(os.environ.get("PORT", 10000))
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"🌐 Servidor web aiohttp corriendo en el puerto {port}")
+
+    loop.run_until_complete(start_server())
+    loop.run_forever()
 
 # ==========================================
-# ARRANQUE PRINCIPAL UNIFICADO
+# ARRANQUE PRINCIPAL
 # ==========================================
-async def main():
-    # Iniciar servidor web para Render
-    await start_web_server()
-    
-    # Iniciar el bot de Telegram
-    await app.start()
-    logger.info("✨ ¡Bot de Telegram conectado y operativo en bucle nativo!")
-    
-    # Mantener corriendo indefinidamente
-    await asyncio.Event().wait()
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    logger.info("🌐 Iniciando servidor web en hilo secundario...")
+    web_thread = Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    
+    logger.info("🤖 Iniciando Bot de Telegram con Pyrogram nativo...")
+    app.run()
