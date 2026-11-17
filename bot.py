@@ -33,12 +33,13 @@ API_HASH = os.getenv("API_HASH", "tu_api_hash")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "tu_token_bot")
 MONGO_URI = os.getenv("MONGO_URI", "tu_uri_mongodb")
 
-# Inicializar cliente de Pyrogram
+# Inicializar cliente de Pyrogram con in_memory=True (Solución definitiva para la nube)
 app = Client(
     "BlackRenownedBot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    in_memory=True
 )
 
 # Conexión a MongoDB Atlas
@@ -163,12 +164,10 @@ if __name__ == "__main__":
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    logger.info("🤖 Iniciando cliente de Pyrogram...")
+    logger.info("🤖 Iniciando cliente de Pyrogram en memoria...")
     app.start()
-    logger.info("✨ ¡Bot conectado y listo para recibir comandos!")
+    logger.info("✨ ¡Bot conectado de forma estable y listo!")
     
-    # Mantiene el bot activo de forma estable sin bloqueos de puertos
     idle()
     
-    logger.info("🛑 Deteniendo bot...")
     app.stop()
