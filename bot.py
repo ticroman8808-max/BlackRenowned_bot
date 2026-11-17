@@ -4,7 +4,7 @@ import logging
 import asyncio
 from threading import Thread
 from flask import Flask
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from pymongo import MongoClient
 
@@ -22,7 +22,7 @@ def home():
     return "🤖 Black Renowned Bot está activo y funcionando perfectamente."
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     app_flask.run(host="0.0.0.0", port=port)
 
 # ==========================================
@@ -156,12 +156,19 @@ async def handle_files(client: Client, message: Message):
     await status_msg.edit_reply_markup(reply_markup=finish_keyboard)
 
 # ==========================================
-# ARRANQUE SIMULTÁNEO (Flask + Pyrogram)
+# ARRANQUE ESTABLE (Flask daemon + Pyrogram Idle)
 # ==========================================
 if __name__ == "__main__":
-    logger.info("🌐 Iniciando servidor web Flask...")
-    flask_thread = Thread(target=run_flask)
+    logger.info("🌐 Iniciando servidor web Flask en hilo secundario...")
+    flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    logger.info("🤖 Iniciando Black Renowned Bot con Pyrogram...")
-    app.run()
+    logger.info("🤖 Iniciando cliente de Pyrogram...")
+    app.start()
+    logger.info("✨ ¡Bot conectado y listo para recibir comandos!")
+    
+    # Mantiene el bot activo de forma estable sin bloqueos de puertos
+    idle()
+    
+    logger.info("🛑 Deteniendo bot...")
+    app.stop()
