@@ -13,6 +13,7 @@ from PIL import Image
 from pymongo import MongoClient
 from pypdf import PdfReader, PdfWriter
 from pyrogram import Client, filters, idle
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 
 # ============================================================
@@ -69,22 +70,36 @@ user_states: dict[int, dict] = {}
 active_tasks: dict[int, asyncio.Task] = {}
 last_progress_edit: dict[int, float] = {}
 
+# Máximo de archivos procesándose a la vez (cuida RAM y disco en Render).
+PROCESS_SEMAPHORE = asyncio.Semaphore(2)
+
 
 # ============================================================
 # UTILIDADES
 # ============================================================
-def main_keyboard():
-    return InlineKeyboardMarkup([
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def main_keyboard(user_id: int | None = None):
+    rows = [
         [InlineKeyboardButton("✏️ Renombrar archivo", callback_data="mode_rename")],
         [InlineKeyboardButton("🖼️ Miniatura + metadatos", callback_data="mode_full")],
         [InlineKeyboardButton("📚 Procesar varios archivos", callback_data="mode_batch")],
         [InlineKeyboardButton("📜 Historial", callback_data="history")],
-        [InlineKeyboardButton("❌ Cancelar proceso", callback_data="cancel")]
-    ])
+        [InlineKeyboardButton("❌ Cancelar proceso", callback_data="cancel")],
+    ]
+    if user_id is not None and is_admin(user_id):
+        rows.append([InlineKeyboardButton("🛡️ Panel admin", callback_data="admin")])
+    return InlineKeyboardMarkup(rows)
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+async def safe_edit(message: Message, text: str, **kwargs):
+    """Edita un mensaje sin romperse si el texto no cambió."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except MessageNotModified:
+        pass
 
 
 def media_size(message: Message) -> int:
@@ -103,7 +118,14 @@ def media_name(message: Message) -> str:
     name = getattr(media, "file_name", None)
     if name:
         return name
-    ext = ".mp4" if message.video or message.video_note else ".bin"
+    if message.voice:
+        ext = ".ogg"
+    elif message.audio:
+        ext = ".mp3"
+    elif message.video or message.video_note or message.animation:
+        ext = ".mp4"
+    else:
+        ext = ".bin"
     return f"archivo_{message.id}{ext}"
 
 
@@ -163,7 +185,10 @@ async def save_history(user_id: int, original: str, final_name: str, mode: str, 
         "result": result,
         "created_at": datetime.now(timezone.utc)
     }
-    await asyncio.to_thread(history_collection.insert_one, record)
+    try:
+        await asyncio.to_thread(history_collection.insert_one, record)
+    except Exception:
+        logger.exception("No se pudo guardar el historial")
 
 
 async def make_thumbnail_jpeg(source: str, destination: str):
@@ -171,13 +196,12 @@ async def make_thumbnail_jpeg(source: str, destination: str):
         with Image.open(source) as image:
             image = image.convert("RGB")
             image.thumbnail((320, 320))
-            image.save(destination, "JPEG", quality=82, optimize=True)
-        if os.path.getsize(destination) >= 200 * 1024:
-            with Image.open(destination) as image:
-                image.save(destination, "JPEG", quality=65, optimize=True)
-    await asyncio.to_thread(convert)
-    if os.path.getsize(destination) >= 200 * 1024:
+            for quality in (82, 65, 50, 35):
+                image.save(destination, "JPEG", quality=quality, optimize=True)
+                if os.path.getsize(destination) < 200 * 1024:
+                    return
         raise ValueError("La miniatura convertida supera 200 KB. Elegí otra imagen.")
+    await asyncio.to_thread(convert)
     return destination
 
 
@@ -225,56 +249,63 @@ async def download_and_send(
     size = media_size(source_message)
 
     try:
-        if size and size > MAX_FILE_SIZE:
-            raise ValueError(
-                f"El archivo pesa {format_bytes(size)} y supera el límite configurado "
-                f"de {MAX_FILE_SIZE_MB} MB."
+        if PROCESS_SEMAPHORE.locked():
+            await safe_edit(status, "⏳ En cola: hay otros archivos procesándose. Empiezo en cuanto se libere.")
+
+        async with PROCESS_SEMAPHORE:
+            if size and size > MAX_FILE_SIZE:
+                raise ValueError(
+                    f"El archivo pesa {format_bytes(size)} y supera el límite configurado "
+                    f"de {MAX_FILE_SIZE_MB} MB."
+                )
+
+            free = shutil.disk_usage(TMP_ROOT).free
+            if size and free < size * 1.25:
+                raise ValueError(
+                    "No hay espacio temporal suficiente en el servidor para procesar este archivo."
+                )
+
+            target = workdir / clean_filename(new_name)
+            downloaded = await bot.download_media(
+                source_message,
+                file_name=str(target),
+                progress=update_progress,
+                progress_args=(status, user_id, "📥 Descargando…")
             )
+            if not downloaded or not os.path.isfile(downloaded):
+                raise RuntimeError("Telegram no completó la descarga del archivo.")
 
-        free = shutil.disk_usage(TMP_ROOT).free
-        if size and free < size * 1.25:
-            raise ValueError(
-                "No hay espacio temporal suficiente en el servidor para procesar este archivo."
+            actual_path = str(downloaded)
+            actual_name = clean_filename(new_name, original_name)
+
+            await safe_edit(status, "⚙️ Aplicando cambios y preparando el archivo…")
+            metadata_changed = False
+            if metadata:
+                try:
+                    metadata_changed = await apply_pdf_metadata(actual_path, metadata)
+                except Exception:
+                    logger.warning("No se pudieron aplicar los metadatos PDF", exc_info=True)
+
+            await safe_edit(status, "📤 Subiendo el archivo procesado…")
+            await bot.send_document(
+                chat_id=user_id,
+                document=actual_path,
+                file_name=actual_name,
+                thumb=thumbnail if thumbnail and os.path.exists(thumbnail) else None,
+                caption=(
+                    "✨ **Black Renowned Bot**\n"
+                    f"📄 `{actual_name}`\n"
+                    + ("🧾 Metadatos PDF actualizados." if metadata_changed else "")
+                ),
+                force_document=True,
+                progress=update_progress,
+                progress_args=(status, user_id, "📤 Subiendo…")
             )
-
-        target = workdir / clean_filename(new_name)
-        downloaded = await bot.download_media(
-            source_message,
-            file_name=str(target),
-            progress=update_progress,
-            progress_args=(status, user_id, "📥 Descargando…")
-        )
-        if not downloaded or not os.path.isfile(downloaded):
-            raise RuntimeError("Telegram no completó la descarga del archivo.")
-
-        actual_path = str(downloaded)
-        actual_name = clean_filename(new_name, original_name)
-
-        await status.edit_text("⚙️ Aplicando cambios y preparando el archivo…")
-        metadata_changed = False
-        if metadata:
-            metadata_changed = await apply_pdf_metadata(actual_path, metadata)
-
-        await status.edit_text("📤 Subiendo el archivo procesado…")
-        await bot.send_document(
-            chat_id=user_id,
-            document=actual_path,
-            file_name=actual_name,
-            thumb=thumbnail if thumbnail and os.path.exists(thumbnail) else None,
-            caption=(
-                "✨ **Black Renowned Bot**\n"
-                f"📄 `{actual_name}`\n"
-                + ("🧾 Metadatos PDF actualizados." if metadata_changed else "")
-            ),
-            force_document=True,
-            progress=update_progress,
-            progress_args=(status, user_id, "📤 Subiendo…")
-        )
-        await save_history(user_id, original_name, actual_name, mode, size, "success")
-        await status.edit_text("✅ **Proceso completado.** Tu archivo está arriba.")
+            await save_history(user_id, original_name, actual_name, mode, size, "success")
+            await safe_edit(status, "✅ **Proceso completado.** Tu archivo está arriba.")
     except asyncio.CancelledError:
         try:
-            await status.edit_text("🛑 **Proceso cancelado.**")
+            await safe_edit(status, "🛑 **Proceso cancelado.**")
         except Exception:
             pass
         await save_history(user_id, original_name, new_name, mode, size, "cancelled")
@@ -282,7 +313,7 @@ async def download_and_send(
     except Exception as exc:
         logger.exception("Error procesando archivo para user_id=%s", user_id)
         try:
-            await status.edit_text(f"❌ **No se pudo procesar el archivo.**\n\n`{str(exc)[:700]}`")
+            await safe_edit(status, f"❌ **No se pudo procesar el archivo.**\n\n`{str(exc)[:700]}`")
         except Exception:
             pass
         await save_history(user_id, original_name, new_name, mode, size, f"error: {str(exc)[:300]}")
@@ -310,33 +341,55 @@ def start_task(user_id: int, coroutine):
 
 
 # ============================================================
+# DEPURACIÓN TEMPORAL
+# Registra en el log cada mensaje que le llega al bot.
+# Cuando todo funcione, podés borrar este bloque entero.
+# ============================================================
+@bot.on_message(group=-1)
+async def debug_logger(client: Client, message: Message):
+    logger.info(
+        "Mensaje recibido de %s: %s",
+        message.from_user.id if message.from_user else None,
+        message.text or "[sin texto]"
+    )
+
+
+# ============================================================
 # COMANDOS
 # ============================================================
 @bot.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     if not message.from_user:
         return
-    await db_upsert_user(message.from_user)
-    user_states[message.from_user.id] = {"stage": "idle"}
+    uid = message.from_user.id
+    try:
+        await db_upsert_user(message.from_user)
+    except Exception:
+        logger.exception("No se pudo registrar al usuario en MongoDB")
+    user_states[uid] = {"stage": "idle"}
     await message.reply_text(
         "🖤 **BLACK RENOWNED BOT**\n\n"
         "Elegí qué querés hacer con tus archivos.",
-        reply_markup=main_keyboard()
+        reply_markup=main_keyboard(uid)
     )
 
 
 @bot.on_message(filters.command("cancel"))
 async def cancel_command(client: Client, message: Message):
+    if not message.from_user:
+        return
     uid = message.from_user.id
     task = active_tasks.get(uid)
     if task and not task.done():
         task.cancel()
     user_states[uid] = {"stage": "idle"}
-    await message.reply_text("🛑 Solicitud de cancelación enviada.", reply_markup=main_keyboard())
+    await message.reply_text("🛑 Solicitud de cancelación enviada.", reply_markup=main_keyboard(uid))
 
 
 @bot.on_message(filters.command("finish"))
 async def finish_batch_command(client: Client, message: Message):
+    if not message.from_user:
+        return
     uid = message.from_user.id
     state = user_states.get(uid, {})
     if state.get("stage") != "batch_collect":
@@ -354,11 +407,15 @@ async def finish_batch_command(client: Client, message: Message):
 
 @bot.on_message(filters.command("history"))
 async def history_command(client: Client, message: Message):
+    if not message.from_user:
+        return
     await show_history(message, message.from_user.id)
 
 
 @bot.on_message(filters.command("admin"))
 async def admin_command(client: Client, message: Message):
+    if not message.from_user:
+        return
     uid = message.from_user.id
     if not is_admin(uid):
         await message.reply_text("⛔ No tenés permiso para acceder al panel.")
@@ -407,7 +464,11 @@ async def callback_handler(client: Client, query: CallbackQuery):
             task.cancel()
         user_states[uid] = {"stage": "idle"}
         await query.answer("Cancelación solicitada.")
-        await query.message.edit_text("🛑 Proceso cancelado o puesto en cancelación.", reply_markup=main_keyboard())
+        await safe_edit(
+            query.message,
+            "🛑 Proceso cancelado o puesto en cancelación.",
+            reply_markup=main_keyboard(uid)
+        )
         return
 
     if data == "history":
@@ -422,33 +483,40 @@ async def callback_handler(client: Client, query: CallbackQuery):
         users = await asyncio.to_thread(users_collection.count_documents, {})
         jobs = await asyncio.to_thread(history_collection.count_documents, {})
         await query.answer()
-        await query.message.edit_text(
+        await safe_edit(
+            query.message,
             f"🛡️ **Panel de administración**\n\nUsuarios: **{users}**\nTrabajos: **{jobs}**",
-            reply_markup=main_keyboard()
+            reply_markup=main_keyboard(uid)
         )
         return
 
     if data == "mode_rename":
         user_states[uid] = {"stage": "rename_wait_file", "mode": "rename"}
         await query.answer()
-        await query.message.edit_text("✏️ **Renombrar archivo**\n\nAhora enviame el archivo que querés modificar.", reply_markup=main_keyboard())
+        await safe_edit(
+            query.message,
+            "✏️ **Renombrar archivo**\n\nAhora enviame el archivo que querés modificar.",
+            reply_markup=main_keyboard(uid)
+        )
     elif data == "mode_full":
         user_states[uid] = {"stage": "full_wait_thumb", "mode": "full", "thumbnail": None}
         await query.answer()
-        await query.message.edit_text(
+        await safe_edit(
+            query.message,
             "🖼️ **Procesamiento completo**\n\n"
             "Enviá primero una imagen para usar como miniatura.\n"
             "La imagen se convertirá a JPEG (máximo 320×320 y menos de 200 KB).",
-            reply_markup=main_keyboard()
+            reply_markup=main_keyboard(uid)
         )
     elif data == "mode_batch":
         user_states[uid] = {"stage": "batch_collect", "mode": "batch", "files": []}
         await query.answer()
-        await query.message.edit_text(
+        await safe_edit(
+            query.message,
             "📚 **Procesamiento por lotes**\n\n"
             "Enviá varios archivos y, cuando termines, escribí /finish.\n"
             "Después podrás asignarles un prefijo común.",
-            reply_markup=main_keyboard()
+            reply_markup=main_keyboard(uid)
         )
 
 
@@ -511,6 +579,7 @@ async def text_handler(client: Client, message: Message):
         prefix = message.text.strip()
         user_states[uid] = {"stage": "processing", "mode": "batch"}
         await message.reply_text(f"📦 Procesando {len(files)} archivo(s)…")
+
         async def process_batch():
             for index, item in enumerate(files, start=1):
                 original_name = media_name(item)
@@ -519,6 +588,7 @@ async def text_handler(client: Client, message: Message):
                 else:
                     final_name = clean_filename(f"{prefix}_{index:02d}{Path(original_name).suffix}")
                 await download_and_send(uid, item, final_name, "batch")
+
         start_task(uid, process_batch())
     elif stage == "batch_collect":
         await message.reply_text("Enviá archivos como documento o multimedia. Cuando termines, escribí /finish.")
@@ -620,7 +690,8 @@ async def main():
     logger.info("Conexión con MongoDB correcta.")
     runner = await start_http_server()
     await bot.start()
-    logger.info("Black Renowned Bot conectado.")
+    me = await bot.get_me()
+    logger.info("Black Renowned Bot conectado como @%s", me.username)
     try:
         await idle()
     finally:
@@ -630,5 +701,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
+    # IMPORTANTE: se usa el mismo event loop con el que Pyrogram creó el cliente.
+    # Con asyncio.run() el bot conecta pero no procesa ningún mensaje.
+    # Funciona con Python 3.11 (fijá PYTHON_VERSION=3.11.9 en Render).
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
