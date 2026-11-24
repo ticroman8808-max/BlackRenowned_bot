@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import logging
 import os
 import re
@@ -44,7 +43,6 @@ TMP_ROOT.mkdir(parents=True, exist_ok=True)
 # VIDEO DE BIENVENIDA (Catbox)
 WELCOME_VIDEO_URL = "https://files.catbox.moe/93nt8g.mp4"
 
-WELCOME_IMAGE: Path | None = None
 LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET_HOURS", "-3"))))
 WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "120"))
 BOT_STARTED_AT = time.time()
@@ -57,23 +55,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BlackRenowned")
 
-mongo_client = MongoClient(
-    MONGO_URI,
-    serverSelectionTimeoutMS=10000,
-    connectTimeoutMS=10000,
-    tls=True
-)
+mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000, tls=True)
 db = mongo_client[DATABASE_NAME]
 users_collection = db["users"]
 history_collection = db["processing_history"]
 
-bot = Client(
-    "BlackRenownedBot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True
-)
+bot = Client("BlackRenownedBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 user_states: dict[int, dict] = {}
 active_tasks: dict[int, asyncio.Task] = {}
@@ -99,97 +86,37 @@ def main_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
         rows.append([btn("🛡️ Panel admin", "admin")])
     return InlineKeyboardMarkup(rows)
 
-AUTH_KEYBOARD = InlineKeyboardMarkup([
-    [btn("✅ ACEPTAR", "auth_accept"), btn("❌ RECHAZAR", "auth_reject")]
-])
-
-ADMIN_APPROVE_KEYBOARD = InlineKeyboardMarkup([
-    [btn("✅ Aprobar acceso", "admin_approve"), btn("❌ Rechazar", "admin_reject")]
-])
-
-ADMIN_KEYBOARD = InlineKeyboardMarkup([
-    [btn("📋 Ver usuarios", "admin_list")],
-    [btn("🔄 Reiniciar bot", "restart")],
-    [btn("⬅️ Volver", "menu"), btn("✖️ Cerrar", "close")],
-])
-
-ADMIN_USER_LIST_KEYBOARD = InlineKeyboardMarkup([
-    [btn("⬅️ Volver al panel", "admin")]
-])
-
-RESTART_CONFIRM_KEYBOARD = InlineKeyboardMarkup([
-    [btn("✅ Sí, reiniciar", "restart_yes"), btn("↩️ No", "admin")],
-])
+AUTH_KEYBOARD = InlineKeyboardMarkup([[btn("✅ ACEPTAR", "auth_accept"), btn("❌ RECHAZAR", "auth_reject")]])
+ADMIN_APPROVE_KEYBOARD = InlineKeyboardMarkup([[btn("✅ Aprobar acceso", "admin_approve"), btn("❌ Rechazar", "admin_reject")]])
+ADMIN_KEYBOARD = InlineKeyboardMarkup([[btn("📋 Ver usuarios", "admin_list")], [btn("🔄 Reiniciar bot", "restart")], [btn("⬅️ Volver", "menu"), btn("✖️ Cerrar", "close")]])
+ADMIN_USER_LIST_KEYBOARD = InlineKeyboardMarkup([[btn("⬅️ Volver al panel", "admin")]])
+RESTART_CONFIRM_KEYBOARD = InlineKeyboardMarkup([[btn("✅ Sí, reiniciar", "restart_yes"), btn("↩️ No", "admin")]])
 
 STOP_KEYBOARD = InlineKeyboardMarkup([[btn("🛑 Detener operación", "stop")]])
 HOME_KEYBOARD = InlineKeyboardMarkup([[btn("🏠 Menú principal", "newmenu")]])
 NAV_KEYBOARD = InlineKeyboardMarkup([[btn("⬅️ Volver", "menu"), btn("✖️ Cerrar", "close")]])
 CANCEL_KEYBOARD = InlineKeyboardMarkup([[btn("✖️ Cancelar", "reset")]])
-KEEPNAME_KEYBOARD = InlineKeyboardMarkup([
-    [btn("📄 Conservar nombre original", "keepname")],
-    [btn("✖️ Cancelar", "reset")],
-])
-META_KEYBOARD = InlineKeyboardMarkup([
-    [btn("⏭️ Omitir metadatos", "skipmeta")],
-    [btn("✖️ Cancelar", "reset")],
-])
-PREFIX_KEYBOARD = InlineKeyboardMarkup([
-    [btn("📄 Conservar nombres originales", "batchorig")],
-    [btn("✖️ Cancelar", "reset")],
-])
-BATCH_KEYBOARD = InlineKeyboardMarkup([
-    [btn("✅ Terminar lote", "finish")],
-    [btn("✖️ Cancelar", "reset")],
-])
+KEEPNAME_KEYBOARD = InlineKeyboardMarkup([[btn("📄 Conservar nombre original", "keepname")], [btn("✖️ Cancelar", "reset")]])
+META_KEYBOARD = InlineKeyboardMarkup([[btn("⏭️ Omitir metadatos", "skipmeta")], [btn("✖️ Cancelar", "reset")]])
+PREFIX_KEYBOARD = InlineKeyboardMarkup([[btn("📄 Conservar nombres originales", "batchorig")], [btn("✖️ Cancelar", "reset")]])
+BATCH_KEYBOARD = InlineKeyboardMarkup([[btn("✅ Terminar lote", "finish")], [btn("✖️ Cancelar", "reset")]])
 
 WELCOME_TEXT = (
     "🖤 **BLACK RENOWNED BOT**\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "Renombrá y personalizá tus archivos de forma rápida y prolija.\n\n"
-    "✦ Renombrar cualquier archivo\n"
-    "✦ Miniatura personalizada\n"
-    "✦ Metadatos para PDF\n"
-    "✦ Procesamiento por lotes\n"
-    "✦ Progreso en tiempo real\n\n"
+    "✦ Renombrar cualquier archivo\n✦ Miniatura personalizada\n✦ Metadatos para PDF\n✦ Procesamiento por lotes\n✦ Progreso en tiempo real\n\n"
     "Elegí una opción 👇"
 )
-
 AUTH_TEXT = (
     "👋 **¡Bienvenido a Black Renowned Bot!**\n\n"
     "Para poder utilizar el bot, necesitás aceptar los términos y condiciones.\n\n"
     "Una vez que aceptes, tu solicitud será enviada al administrador para su aprobación."
 )
-
-PENDING_TEXT = (
-    "⏳ **Solicitud enviada**\n\n"
-    "Tu pedido de acceso ha sido enviado al administrador. "
-    "Por favor, espera a que sea aprobado para poder usar el bot."
-)
-
-REJECTED_TEXT = (
-    "⛔ **Acceso denegado**\n\n"
-    "Tu solicitud ha sido rechazada. Si crees que es un error, contacta al administrador."
-)
-
-HELP_TEXT = (
-    "ℹ️ **Ayuda**\n"
-    "━━━━━━━━━━━━━━━━━━\n"
-    "✏️ **Renombrar:** enviás el archivo y el nuevo nombre.\n"
-    "🖼️ **Miniatura + PDF:** elegís una portada y, si querés, metadatos.\n"
-    "📚 **Lote:** varios archivos con un prefijo común.\n\n"
-    "🛑 Podés detener cualquier operación con el botón del progreso o con /cancel.\n"
-    "🏠 Si algo se traba, /start vuelve al menú."
-)
-
-META_TEXT = (
-    "🧾 **Metadatos PDF (opcional)**\n\n"
-    "Enviá los datos en líneas separadas:\n\n"
-    "`Título: Mi documento`\n"
-    "`Autor: Black Renowned`\n"
-    "`Asunto: Archivo`\n"
-    "`Palabras clave: manga, pdf`\n\n"
-    "O tocá **Omitir** para dejarlos como están."
-)
+PENDING_TEXT = "⏳ **Solicitud enviada**\n\nTu pedido de acceso ha sido enviado al administrador. Por favor, espera a que sea aprobado."
+REJECTED_TEXT = "⛔ **Acceso denegado**\n\nTu solicitud ha sido rechazada. Si crees que es un error, contacta al administrador."
+HELP_TEXT = "ℹ️ **Ayuda**\n━━━━━━━━━━━━━━━━━━\n✏️ **Renombrar:** enviás el archivo y el nuevo nombre.\n🖼️ **Miniatura + PDF:** elegís una portada y, si querés, metadatos.\n📚 **Lote:** varios archivos con un prefijo común.\n\n🛑 Podés detener cualquier operación con el botón del progreso o con /cancel.\n🏠 Si algo se traba, /start vuelve al menú."
+META_TEXT = "🧾 **Metadatos PDF (opcional)**\n\nEnviá los datos en líneas separadas:\n\n`Título: Mi documento`\n`Autor: Black Renowned`\n`Asunto: Archivo`\n`Palabras clave: manga, pdf`\n\nO tocá **Omitir** para dejarlos como están."
 
 # ============================================================
 # UTILIDADES Y BASE DE DATOS
@@ -209,28 +136,17 @@ async def safe_edit(message: Message, text: str, **kwargs):
         logger.warning("No se pudo editar un mensaje", exc_info=True)
 
 def media_size(message: Message) -> int:
-    media = (
-        message.document or message.video or message.audio or
-        message.animation or message.voice or message.video_note
-    )
+    media = (message.document or message.video or message.audio or message.animation or message.voice or message.video_note)
     return int(getattr(media, "file_size", 0) or 0)
 
 def media_name(message: Message) -> str:
-    media = (
-        message.document or message.video or message.audio or
-        message.animation or message.voice or message.video_note
-    )
+    media = (message.document or message.video or message.audio or message.animation or message.voice or message.video_note)
     name = getattr(media, "file_name", None)
-    if name:
-        return name
-    if message.voice:
-        ext = ".ogg"
-    elif message.audio:
-        ext = ".mp3"
-    elif message.video or message.video_note or message.animation:
-        ext = ".mp4"
-    else:
-        ext = ".bin"
+    if name: return name
+    if message.voice: ext = ".ogg"
+    elif message.audio: ext = ".mp3"
+    elif message.video or message.video_note or message.animation: ext = ".mp4"
+    else: ext = ".bin"
     return f"archivo_{message.id}{ext}"
 
 def clean_filename(name: str, fallback: str = "archivo") -> str:
@@ -242,8 +158,7 @@ def clean_filename(name: str, fallback: str = "archivo") -> str:
 def format_bytes(value: int) -> str:
     size = float(value)
     for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.1f} {unit}"
+        if size < 1024 or unit == "GB": return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} GB"
 
@@ -251,51 +166,36 @@ def format_duration(seconds: float) -> str:
     seconds = int(max(seconds, 0))
     hours, rest = divmod(seconds, 3600)
     minutes, secs = divmod(rest, 60)
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {secs}s"
+    if hours: return f"{hours}h {minutes}m"
+    if minutes: return f"{minutes}m {secs}s"
     return f"{secs}s"
 
 def progress_bar(percent: int, width: int = 20) -> str:
     filled = min(width, max(0, percent) * width // 100)
     return "▰" * filled + "▱" * (width - filled)
 
-async def update_progress(
-    current: int, total: int, status: Message,
-    user_id: int, label: str, filename: str, started: float
-):
+async def update_progress(current: int, total: int, status: Message, user_id: int, label: str, filename: str, started: float):
     now = time.monotonic()
-    if current < total and now - last_progress_edit.get(user_id, 0) < 2.5:
-        return
+    if current < total and now - last_progress_edit.get(user_id, 0) < 2.5: return
     last_progress_edit[user_id] = now
     percent = int(current * 100 / total) if total else 0
     elapsed = max(now - started, 0.001)
     speed = current / elapsed
     eta = (total - current) / speed if speed > 0 and total else 0
-    text = (
-        f"{label}\n"
-        f"`{md_safe(filename)[:45]}`\n\n"
-        f"{progress_bar(percent)}  **{percent}%**\n"
-        f"{format_bytes(current)} / {format_bytes(total)}\n"
-        f"⚡ {format_bytes(int(speed))}/s · ⏳ {format_duration(eta)}"
-    )
-    try:
-        await status.edit_text(text, reply_markup=STOP_KEYBOARD)
-    except Exception:
-        pass
+    text = (f"{label}\n`{md_safe(filename)[:45]}`\n\n{progress_bar(percent)}  **{percent}%**\n"
+            f"{format_bytes(current)} / {format_bytes(total)}\n⚡ {format_bytes(int(speed))}/s · ⏳ {format_duration(eta)}")
+    try: await status.edit_text(text, reply_markup=STOP_KEYBOARD)
+    except Exception: pass
 
 def cleanup_thumbnail(state: dict):
     thumb = state.get("thumbnail")
     if thumb:
         folder = Path(thumb).parent
-        if folder.name.startswith("thumb_"):
-            shutil.rmtree(folder, ignore_errors=True)
+        if folder.name.startswith("thumb_"): shutil.rmtree(folder, ignore_errors=True)
 
 def reset_state(user_id: int):
     state = user_states.get(user_id, {})
-    if state.get("stage") != "processing":
-        cleanup_thumbnail(state)
+    if state.get("stage") != "processing": cleanup_thumbnail(state)
     user_states[user_id] = {"stage": "idle"}
 
 def result_icon(result: str) -> str:
@@ -304,62 +204,30 @@ def result_icon(result: str) -> str:
     return "❌"
 
 async def db_upsert_user(user):
-    await asyncio.to_thread(
-        users_collection.update_one,
-        {"user_id": user.id},
-        {"$set": {
-            "username": user.username,
-            "first_name": user.first_name,
-            "last_seen": datetime.now(timezone.utc)
-        }, "$setOnInsert": {
-            "created_at": datetime.now(timezone.utc),
-            "status": "nuevo"
-        }},
-        True
-    )
+    await asyncio.to_thread(users_collection.update_one, {"user_id": user.id},
+        {"$set": {"username": user.username, "first_name": user.first_name, "last_seen": datetime.now(timezone.utc)},
+         "$setOnInsert": {"created_at": datetime.now(timezone.utc), "status": "nuevo"}}, True)
 
 async def get_user_status(user_id: int) -> str:
     user = await asyncio.to_thread(users_collection.find_one, {"user_id": user_id})
-    if not user:
-        return "desconocido"
+    if not user: return "desconocido"
     return user.get("status", "nuevo")
 
 async def set_user_status(user_id: int, status: str):
-    await asyncio.to_thread(
-        users_collection.update_one,
-        {"user_id": user_id},
-        {"$set": {"status": status}}
-    )
+    await asyncio.to_thread(users_collection.update_one, {"user_id": user_id}, {"$set": {"status": status}})
 
 async def save_history(user_id: int, original: str, final_name: str, mode: str, size: int, result: str):
-    record = {
-        "user_id": user_id,
-        "original_name": original,
-        "final_name": final_name,
-        "mode": mode,
-        "size": size,
-        "result": result,
-        "created_at": datetime.now(timezone.utc)
-    }
-    try:
-        await asyncio.to_thread(history_collection.insert_one, record)
-    except Exception:
-        logger.exception("No se pudo guardar el historial")
-
-async def build_history_text(user_id: int) -> str:
-    records = await asyncio.to_thread(
-        lambda: list(history_collection.find({"user_id": user_id}).sort("_id", -1).limit(8))
-    )
-    if not records:
-        return "📜 **Historial**\n\nTodavía no procesaste ningún archivo."
+    record = {"user_id": user_id, "original_name": original, "final_name": final_name, "mode": mode, "size": size, "result": result, "created_at": datetime.now(timezone.utc)}
+    try: await asyncio.to_thread(history_collection.insert_one, record)
+    except Exception: logger.exception("No se pudo guardar el historial")
+        async def build_history_text(user_id: int) -> str:
+    records = await asyncio.to_thread(lambda: list(history_collection.find({"user_id": user_id}).sort("_id", -1).limit(8)))
+    if not records: return "📜 **Historial**\n\nTodavía no procesaste ningún archivo."
     lines = ["📜 **Últimos trabajos**\n"]
     for item in records:
         date = item.get("created_at")
-        if date:
-            date = date.replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ)
-            date_text = date.strftime("%d/%m %H:%M")
-        else:
-            date_text = "sin fecha"
+        if date: date = date.replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ); date_text = date.strftime("%d/%m %H:%M")
+        else: date_text = "sin fecha"
         name = md_safe(str(item.get("final_name", "archivo")))[:34]
         icon = result_icon(str(item.get("result", "")))
         lines.append(f"{icon} `{name}`\n      {date_text}")
@@ -371,26 +239,17 @@ async def build_admin_text() -> str:
     jobs = await asyncio.to_thread(history_collection.count_documents, {})
     successes = await asyncio.to_thread(history_collection.count_documents, {"result": "success"})
     running = sum(1 for task in active_tasks.values() if not task.done())
-    try:
-        free = format_bytes(shutil.disk_usage(TMP_ROOT).free)
-    except Exception:
-        free = "desconocido"
-    return (
-        "🛡️ **Panel de administración**\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Usuarios aprobados: **{users}**\n"
-        f"⏳ Solicitudes pendientes: **{pending}**\n"
-        f"📦 Trabajos: **{jobs}** (✅ {successes})\n"
-        f"⚙️ En curso ahora: **{running}**\n"
-        f"💽 Espacio libre: **{free}**\n"
-        f"⏱️ Activo hace: **{format_duration(time.time() - BOT_STARTED_AT)}**"
-    )
+    try: free = format_bytes(shutil.disk_usage(TMP_ROOT).free)
+    except Exception: free = "desconocido"
+    return ("🛡️ **Panel de administración**\n━━━━━━━━━━━━━━━━━━\n"
+            f"👥 Usuarios aprobados: **{users}**\n⏳ Solicitudes pendientes: **{pending}**\n"
+            f"📦 Trabajos: **{jobs}** (✅ {successes})\n⚙️ En curso ahora: **{running}**\n"
+            f"💽 Espacio libre: **{free}**\n⏱️ Activo hace: **{format_duration(time.time() - BOT_STARTED_AT)}**")
 
 async def build_user_list_text() -> str:
     cursor = users_collection.find({"status": "aprobado"})
     users = await asyncio.to_thread(lambda: list(cursor))
-    if not users:
-        return "📋 **Lista de usuarios aprobados**\n\nNo hay usuarios aprobados aún."
+    if not users: return "📋 **Lista de usuarios aprobados**\n\nNo hay usuarios aprobados aún."
     lines = ["📋 **Usuarios aprobados:**\n"]
     for u in users:
         name = md_safe(u.get("first_name", "Sin nombre"))
@@ -398,250 +257,115 @@ async def build_user_list_text() -> str:
         lines.append(f"👤 {name} ({username})\n   ID: `{u['user_id']}`\n")
     return "\n".join(lines)
 
-def prepare_welcome_image() -> Path | None:
-    custom = os.getenv("WELCOME_IMAGE", "").strip()
-    if custom:
-        path = Path(__file__).resolve().parent / custom
-        if path.exists():
-            return path
-    try:
-        data = base64.b64decode("".join(WELCOME_IMAGE_B64.split()))
-        if data:
-            path = TMP_ROOT / "welcome_embedded.jpg"
-            path.write_bytes(data)
-            return path
-    except Exception:
-        logger.warning("No se pudo preparar la imagen de bienvenida incluida", exc_info=True)
-    fallback = Path(__file__).resolve().parent / "welcome.jpg"
-    return fallback if fallback.exists() else None
-
 async def send_welcome(message: Message, user_id: int):
     status = await get_user_status(user_id)
-    
     if is_admin(user_id) or status == "aprobado":
-        if WELCOME_IMAGE and WELCOME_IMAGE.exists():
-            try:
-                await message.reply_photo(
-                    photo=str(WELCOME_IMAGE),
-                    caption=WELCOME_TEXT,
-                    reply_markup=main_keyboard(user_id)
-                )
-                return
-            except Exception:
-                logger.warning("No se pudo enviar la imagen de bienvenida", exc_info=True)
         await message.reply_text(WELCOME_TEXT, reply_markup=main_keyboard(user_id))
         return
-
     if status == "rechazado":
         await message.reply_text(REJECTED_TEXT)
         return
-
     if status == "pendiente":
         await message.reply_text(PENDING_TEXT)
         return
-
     try:
         if WELCOME_VIDEO_URL:
-            await message.reply_video(
-                video=WELCOME_VIDEO_URL,
-                caption=AUTH_TEXT,
-                reply_markup=AUTH_KEYBOARD
-            )
-            return
-        elif WELCOME_IMAGE and WELCOME_IMAGE.exists():
-            await message.reply_photo(
-                photo=str(WELCOME_IMAGE),
-                caption=AUTH_TEXT,
-                reply_markup=AUTH_KEYBOARD
-            )
+            await message.reply_video(video=WELCOME_VIDEO_URL, caption=AUTH_TEXT, reply_markup=AUTH_KEYBOARD)
             return
     except Exception as e:
-        logger.error(f"Error enviando video/imagen de bienvenida: {e}")
-    
+        logger.error(f"Error enviando video de bienvenida: {e}")
     await message.reply_text(AUTH_TEXT, reply_markup=AUTH_KEYBOARD)
 
 async def make_thumbnail_jpeg(source: str, destination: str):
     def convert():
         with Image.open(source) as image:
-            image = image.convert("RGB")
-            image.thumbnail((320, 320))
+            image = image.convert("RGB"); image.thumbnail((320, 320))
             for quality in (82, 65, 50, 35):
                 image.save(destination, "JPEG", quality=quality, optimize=True)
-                if os.path.getsize(destination) < 200 * 1024:
-                    return
+                if os.path.getsize(destination) < 200 * 1024: return
         raise ValueError("La miniatura convertida supera 200 KB. Elegí otra imagen.")
     await asyncio.to_thread(convert)
     return destination
 
 async def apply_pdf_metadata(path: str, metadata: dict) -> bool:
-    if Path(path).suffix.lower() != ".pdf":
-        return False
-
+    if Path(path).suffix.lower() != ".pdf": return False
     def edit_pdf():
-        reader = PdfReader(path)
-        writer = PdfWriter()
-        writer.clone_document_from_reader(reader)
-        fields = {}
-        mapping = {
-            "title": "/Title",
-            "author": "/Author",
-            "subject": "/Subject",
-            "keywords": "/Keywords"
-        }
+        reader = PdfReader(path); writer = PdfWriter(); writer.clone_document_from_reader(reader)
+        fields = {}; mapping = {"title": "/Title", "author": "/Author", "subject": "/Subject", "keywords": "/Keywords"}
         for key, pdf_key in mapping.items():
             value = metadata.get(key, "").strip()
-            if value:
-                fields[pdf_key] = value
-        if fields:
-            writer.add_metadata(fields)
+            if value: fields[pdf_key] = value
+        if fields: writer.add_metadata(fields)
         temp_path = path + ".tmp"
-        with open(temp_path, "wb") as output:
-            writer.write(output)
+        with open(temp_path, "wb") as output: writer.write(output)
         os.replace(temp_path, path)
         return bool(fields)
-
     return await asyncio.to_thread(edit_pdf)
 
 def parse_metadata(text: str) -> dict:
-    keys = {
-        "título": "title", "titulo": "title", "title": "title",
-        "autor": "author", "author": "author",
-        "asunto": "subject", "subject": "subject",
-        "palabras clave": "keywords", "keywords": "keywords"
-    }
+    keys = {"título": "title", "titulo": "title", "title": "title", "autor": "author", "author": "author", "asunto": "subject", "subject": "subject", "palabras clave": "keywords", "keywords": "keywords"}
     metadata = {}
     for line in text.splitlines():
         if ":" in line:
             label, value = line.split(":", 1)
             key = keys.get(label.strip().lower())
-            if key:
-                metadata[key] = value.strip()
+            if key: metadata[key] = value.strip()
     return metadata
 
 # ============================================================
 # PROCESAMIENTO DE ARCHIVOS
 # ============================================================
-async def download_and_send(
-    user_id: int,
-    source_message: Message,
-    new_name: str,
-    mode: str,
-    thumbnail: str | None = None,
-    metadata: dict | None = None,
-    position: tuple[int, int] | None = None
-):
+async def download_and_send(user_id: int, source_message: Message, new_name: str, mode: str, thumbnail: str | None = None, metadata: dict | None = None, position: tuple[int, int] | None = None):
     workdir = Path(tempfile.mkdtemp(prefix=f"user_{user_id}_", dir=TMP_ROOT))
     tag = f" ({position[0]}/{position[1]})" if position else ""
-    status = await source_message.reply_text(
-        f"📥 Preparando descarga…{tag}", reply_markup=STOP_KEYBOARD
-    )
-    original_name = media_name(source_message)
-    size = media_size(source_message)
-
+    status = await source_message.reply_text(f"📥 Preparando descarga…{tag}", reply_markup=STOP_KEYBOARD)
+    original_name = media_name(source_message); size = media_size(source_message)
     try:
         if PROCESS_SEMAPHORE.locked():
-            await safe_edit(
-                status,
-                f"⏳ **En cola**{tag}\n\nHay otros archivos procesándose. "
-                "Empiezo en cuanto se libere un lugar.",
-                reply_markup=STOP_KEYBOARD
-            )
-
+            await safe_edit(status, f"⏳ **En cola**{tag}\n\nHay otros archivos procesándose. Empiezo en cuanto se libere un lugar.", reply_markup=STOP_KEYBOARD)
         async with PROCESS_SEMAPHORE:
             if size and size > MAX_FILE_SIZE:
-                raise ValueError(
-                    f"El archivo pesa {format_bytes(size)} y supera el límite configurado "
-                    f"de {MAX_FILE_SIZE_MB} MB."
-                )
-
+                raise ValueError(f"El archivo pesa {format_bytes(size)} y supera el límite configurado de {MAX_FILE_SIZE_MB} MB.")
             free = shutil.disk_usage(TMP_ROOT).free
-            if size and free < size * 1.25:
-                raise ValueError(
-                    "No hay espacio temporal suficiente en el servidor para procesar este archivo."
-                )
-
-            actual_name = clean_filename(new_name, original_name)
-            target = workdir / actual_name
-
+            if size and free < size * 1.25: raise ValueError("No hay espacio temporal suficiente en el servidor para procesar este archivo.")
+            actual_name = clean_filename(new_name, original_name); target = workdir / actual_name
             started = time.monotonic()
-            downloaded = await bot.download_media(
-                source_message,
-                file_name=str(target),
-                progress=update_progress,
-                progress_args=(status, user_id, f"📥 **Descargando**{tag}", actual_name, started)
-            )
-            if not downloaded or not os.path.isfile(downloaded):
-                raise RuntimeError("Telegram no completó la descarga del archivo.")
-
+            downloaded = await bot.download_media(source_message, file_name=str(target), progress=update_progress, progress_args=(status, user_id, f"📥 **Descargando**{tag}", actual_name, started))
+            if not downloaded or not os.path.isfile(downloaded): raise RuntimeError("Telegram no completó la descarga del archivo.")
             actual_path = str(downloaded)
-
-            await safe_edit(
-                status, f"⚙️ **Aplicando cambios**{tag}\n\nPreparando tu archivo…",
-                reply_markup=STOP_KEYBOARD
-            )
+            await safe_edit(status, f"⚙️ **Aplicando cambios**{tag}\n\nPreparando tu archivo…", reply_markup=STOP_KEYBOARD)
             metadata_changed = False
             if metadata:
-                try:
-                    metadata_changed = await apply_pdf_metadata(actual_path, metadata)
-                except Exception:
-                    logger.warning("No se pudieron aplicar los metadatos PDF", exc_info=True)
-
+                try: metadata_changed = await apply_pdf_metadata(actual_path, metadata)
+                except Exception: logger.warning("No se pudieron aplicar los metadatos PDF", exc_info=True)
             final_size = os.path.getsize(actual_path)
-            caption = (
-                "✨ **Black Renowned Bot**\n"
-                f"📄 `{md_safe(actual_name)}`\n"
-                f"💾 {format_bytes(final_size)}"
-            )
-            if metadata_changed:
-                caption += "\n🧾 Metadatos PDF actualizados"
-
+            caption = f"✨ **Black Renowned Bot**\n📄 `{md_safe(actual_name)}`\n💾 {format_bytes(final_size)}"
+            if metadata_changed: caption += "\n🧾 Metadatos PDF actualizados"
             started = time.monotonic()
-            await bot.send_document(
-                chat_id=user_id,
-                document=actual_path,
-                file_name=actual_name,
-                thumb=thumbnail if thumbnail and os.path.exists(thumbnail) else None,
-                caption=caption,
-                force_document=True,
-                progress=update_progress,
-                progress_args=(status, user_id, f"📤 **Subiendo**{tag}", actual_name, started)
-            )
+            await bot.send_document(chat_id=user_id, document=actual_path, file_name=actual_name, thumb=thumbnail if thumbnail and os.path.exists(thumbnail) else None, caption=caption, force_document=True, progress=update_progress, progress_args=(status, user_id, f"📤 **Subiendo**{tag}", actual_name, started))
             await save_history(user_id, original_name, actual_name, mode, size, "success")
-            await safe_edit(
-                status, f"✅ **¡Listo!**{tag}\n\nTu archivo está arriba.",
-                reply_markup=HOME_KEYBOARD
-            )
+            await safe_edit(status, f"✅ **¡Listo!**{tag}\n\nTu archivo está arriba.", reply_markup=HOME_KEYBOARD)
     except asyncio.CancelledError:
         await safe_edit(status, "🛑 **Operación detenida.**", reply_markup=HOME_KEYBOARD)
         await save_history(user_id, original_name, new_name, mode, size, "cancelled")
         raise
     except Exception as exc:
         logger.exception("Error procesando archivo para user_id=%s", user_id)
-        await safe_edit(
-            status,
-            f"❌ **No se pudo procesar el archivo.**\n\n`{md_safe(str(exc))[:600]}`",
-            reply_markup=HOME_KEYBOARD
-        )
+        await safe_edit(status, f"❌ **No se pudo procesar el archivo.**\n\n`{md_safe(str(exc))[:600]}`", reply_markup=HOME_KEYBOARD)
         await save_history(user_id, original_name, new_name, mode, size, f"error: {str(exc)[:300]}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         if thumbnail:
             thumb_dir = Path(thumbnail).parent
-            if thumb_dir.exists() and thumb_dir.name.startswith("thumb_"):
-                shutil.rmtree(thumb_dir, ignore_errors=True)
+            if thumb_dir.exists() and thumb_dir.name.startswith("thumb_"): shutil.rmtree(thumb_dir, ignore_errors=True)
 
 def start_task(user_id: int, coroutine):
     old = active_tasks.get(user_id)
-    if old and not old.done():
-        old.cancel()
-    task = asyncio.create_task(coroutine)
-    active_tasks[user_id] = task
-
+    if old and not old.done(): old.cancel()
+    task = asyncio.create_task(coroutine); active_tasks[user_id] = task
     def cleanup(done_task):
-        if active_tasks.get(user_id) is done_task:
-            active_tasks.pop(user_id, None)
-        if user_states.get(user_id, {}).get("stage") == "processing":
-            user_states[user_id] = {"stage": "idle"}
+        if active_tasks.get(user_id) is done_task: active_tasks.pop(user_id, None)
+        if user_states.get(user_id, {}).get("stage") == "processing": user_states[user_id] = {"stage": "idle"}
     task.add_done_callback(cleanup)
 
 def launch_rename(user_id: int, original: Message, new_name: str):
@@ -649,46 +373,29 @@ def launch_rename(user_id: int, original: Message, new_name: str):
     start_task(user_id, download_and_send(user_id, original, new_name, "rename"))
 
 def launch_full(user_id: int, state: dict, metadata: dict):
-    original = state["file_message"]
-    new_name = state["new_name"]
-    thumbnail = state.get("thumbnail")
+    original = state["file_message"]; new_name = state["new_name"]; thumbnail = state.get("thumbnail")
     user_states[user_id] = {"stage": "processing", "mode": "full"}
     start_task(user_id, download_and_send(user_id, original, new_name, "full", thumbnail, metadata))
 
 def launch_batch(user_id: int, files: list, prefix: str):
-    user_states[user_id] = {"stage": "processing", "mode": "batch"}
-    total = len(files)
-
+    user_states[user_id] = {"stage": "processing", "mode": "batch"}; total = len(files)
     async def process_batch():
         for index, item in enumerate(files, start=1):
             original_name = media_name(item)
-            if prefix.lower() == "original":
-                final_name = original_name
-            else:
-                final_name = clean_filename(f"{prefix}_{index:02d}{Path(original_name).suffix}")
-            await download_and_send(
-                user_id, item, final_name, "batch", position=(index, total)
-            )
-
+            final_name = original_name if prefix.lower() == "original" else clean_filename(f"{prefix}_{index:02d}{Path(original_name).suffix}")
+            await download_and_send(user_id, item, final_name, "batch", position=(index, total))
     start_task(user_id, process_batch())
 
 def finish_batch_stage(user_id: int) -> str | None:
     state = user_states.get(user_id, {})
-    if state.get("stage") != "batch_collect":
-        return "No hay un lote pendiente. Elegí 📚 Lote de archivos en el menú."
-    if not state.get("files"):
-        return "Todavía no recibí archivos para el lote."
+    if state.get("stage") != "batch_collect": return "No hay un lote pendiente. Elegí 📚 Lote de archivos en el menú."
+    if not state.get("files"): return "Todavía no recibí archivos para el lote."
     state["stage"] = "batch_prefix"
     return None
 
 def prefix_prompt(user_id: int) -> str:
     count = len(user_states.get(user_id, {}).get("files", []))
-    return (
-        f"📚 **Lote listo: {count} archivo(s)**\n\n"
-        "Escribí un **prefijo** para los nombres finales "
-        "(por ejemplo `Capitulo` genera `Capitulo_01.pdf`, `Capitulo_02.pdf`…) "
-        "o tocá el botón para conservar los nombres originales."
-    )
+    return f"📚 **Lote listo: {count} archivo(s)**\n\nEscribí un **prefijo** para los nombres finales (por ejemplo `Capitulo` genera `Capitulo_01.pdf`, `Capitulo_02.pdf`…) o tocá el botón para conservar los nombres originales."
 
 # ============================================================
 # REINICIO Y VIGILANTE
@@ -701,120 +408,121 @@ async def watchdog():
     failures = 0
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL)
-        if any(not task.done() for task in active_tasks.values()):
-            failures = 0
-            continue
-        try:
-            await asyncio.wait_for(bot.get_me(), timeout=45)
-            failures = 0
-        except asyncio.CancelledError:
-            raise
+        if any(not task.done() for task in active_tasks.values()): failures = 0; continue
+        try: await asyncio.wait_for(bot.get_me(), timeout=45); failures = 0
+        except asyncio.CancelledError: raise
         except Exception:
-            failures += 1
-            logger.warning("Vigilante: fallo %s/3 al comprobar Telegram", failures, exc_info=True)
-            if failures >= 3:
-                restart_process("sin conexión con Telegram")
-
-# ============================================================
-# MIDDLEWARE DE AUTENTICACIÓN
+            failures += 1; logger.warning("Vigilante: fallo %s/3 al comprobar Telegram", failures, exc_info=True)
+            if failures >= 3: restart_process("sin conexión con Telegram")
+                # ============================================================
+# MIDDLEWARE, COMANDOS Y BOTONES
 # ============================================================
 @bot.on_message(filters.command(COMMANDS), group=-2)
 async def auth_middleware(client: Client, message: Message):
-    if not message.from_user:
-        return
+    if not message.from_user: return
     uid = message.from_user.id
-    
-    if is_admin(uid) or message.command[0] == "start":
-        return
-    
+    if is_admin(uid) or message.command[0] == "start": return
     status = await get_user_status(uid)
     if status != "aprobado":
         await message.reply_text("⛔ Primero debes usar /start y ser aprobado para usar el bot.")
         message.stop_propagation()
 
-# ============================================================
-# COMANDOS
-# ============================================================
 @bot.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     if not message.from_user: return
     uid = message.from_user.id
-    try:
-        await db_upsert_user(message.from_user)
-    except Exception:
-        logger.exception("No se pudo registrar al usuario en MongoDB")
-    reset_state(uid)
-    await send_welcome(message, uid)
+    try: await db_upsert_user(message.from_user)
+    except Exception: logger.exception("No se pudo registrar al usuario en MongoDB")
+    reset_state(uid); await send_welcome(message, uid)
 
 @bot.on_message(filters.command("cancel"))
 async def cancel_command(client: Client, message: Message):
     if not message.from_user: return
-    uid = message.from_user.id
-    task = active_tasks.get(uid)
-    if task and not task.done():
-        task.cancel()
-    reset_state(uid)
-    await message.reply_text("🛑 **Operación detenida.**", reply_markup=HOME_KEYBOARD)
+    uid = message.from_user.id; task = active_tasks.get(uid)
+    if task and not task.done(): task.cancel()
+    reset_state(uid); await message.reply_text("🛑 **Operación detenida.**", reply_markup=HOME_KEYBOARD)
 
 @bot.on_message(filters.command("finish"))
 async def finish_batch_command(client: Client, message: Message):
     if not message.from_user: return
-    uid = message.from_user.id
-    error = finish_batch_stage(uid)
-    if error:
-        await message.reply_text(error)
-        return
+    uid = message.from_user.id; error = finish_batch_stage(uid)
+    if error: await message.reply_text(error); return
     await message.reply_text(prefix_prompt(uid), reply_markup=PREFIX_KEYBOARD)
 
 @bot.on_message(filters.command("history"))
 async def history_command(client: Client, message: Message):
     if not message.from_user: return
-    await message.reply_text(
-        await build_history_text(message.from_user.id), reply_markup=NAV_KEYBOARD
-    )
+    await message.reply_text(await build_history_text(message.from_user.id), reply_markup=NAV_KEYBOARD)
 
 @bot.on_message(filters.command("admin"))
 async def admin_command(client: Client, message: Message):
     if not message.from_user: return
-    if not is_admin(message.from_user.id):
-        await message.reply_text("⛔ No tenés permiso para acceder al panel.")
-        return
+    if not is_admin(message.from_user.id): await message.reply_text("⛔ No tenés permiso para acceder al panel."); return
     await message.reply_text(await build_admin_text(), reply_markup=ADMIN_KEYBOARD)
 
 @bot.on_message(filters.command("restart"))
 async def restart_command(client: Client, message: Message):
     if not message.from_user: return
-    if not is_admin(message.from_user.id):
-        await message.reply_text("⛔ No tenés permiso para reiniciar el bot.")
-        return
-    await message.reply_text(
-        "⚠️ **¿Reiniciar el bot?**\n\n"
-        "Se detienen los procesos en curso y vuelve en menos de un minuto.",
-        reply_markup=RESTART_CONFIRM_KEYBOARD
-    )
+    if not is_admin(message.from_user.id): await message.reply_text("⛔ No tenés permiso para reiniciar el bot."); return
+    await message.reply_text("⚠️ **¿Reiniciar el bot?**\n\nSe detienen los procesos en curso y vuelve en menos de un minuto.", reply_markup=RESTART_CONFIRM_KEYBOARD)
 
-# ============================================================
-# BOTONES Y CALLBACKS
-# ============================================================
 @bot.on_callback_query()
 async def callback_handler(client: Client, query: CallbackQuery):
-    uid = query.from_user.id
-    data = query.data or ""
-    message = query.message
-    if message is None:
-        await query.answer("Este mensaje ya no está disponible. Escribí /start.", show_alert=True)
-        return
-
+    uid = query.from_user.id; data = query.data or ""; message = query.message
+    if message is None: await query.answer("Este mensaje ya no está disponible. Escribí /start.", show_alert=True); return
     status = await get_user_status(uid)
 
     if data == "auth_accept":
         if status in ("nuevo", "desconocido"):
-            await set_user_status(uid, "pendiente")
-            await query.answer("Solicitud enviada.")
-            await safe_edit(message, PENDING_TEXT)
-            
+            await set_user_status(uid, "pendiente"); await query.answer("Solicitud enviada."); await safe_edit(message, PENDING_TEXT)
             user = query.from_user
-            admin_text = (
-                f"🔔 **Nueva solicitud de acceso**\n\n"
-                f"👤 **Nombre:** {user.first_name}\n"
-                f"
+            admin_text = f"🔔 **Nueva solicitud de acceso**\n\n👤 **Nombre:** {user.first_name}\n🆔 **ID:** `{uid}`"
+            for admin_id in ADMIN_IDS:
+                try: await bot.send_message(admin_id, admin_text, reply_markup=ADMIN_APPROVE_KEYBOARD)
+                except Exception: pass
+        else: await query.answer("Ya has enviado una solicitud.", show_alert=True)
+
+    elif data == "auth_reject":
+        await set_user_status(uid, "rechazado"); await query.answer("Rechazado."); await safe_edit(message, REJECTED_TEXT)
+
+    elif data == "admin_approve":
+        if not is_admin(uid): await query.answer("Acceso denegado.", show_alert=True); return
+        parts = message.text.split("ID:** `")
+        if len(parts) > 1:
+            target_id = int(parts[1].split("`")[0])
+            await set_user_status(target_id, "aprobado"); await query.answer("Usuario aprobado.")
+            await safe_edit(message, f"{message.text}\n\n✅ **APROBADO**")
+            try: await bot.send_message(target_id, "✅ **¡Acceso aprobado!** Ya podés usar el bot. Escribí /start para comenzar.")
+            except Exception: pass
+
+    elif data == "admin_reject":
+        if not is_admin(uid): await query.answer("Acceso denegado.", show_alert=True); return
+        parts = message.text.split("ID:** `")
+        if len(parts) > 1:
+            target_id = int(parts[1].split("`")[0])
+            await set_user_status(target_id, "rechazado"); await query.answer("Usuario rechazado.")
+            await safe_edit(message, f"{message.text}\n\n❌ **RECHAZADO**")
+            try: await bot.send_message(target_id, "⛔ **Acceso denegado.** Tu solicitud fue rechazada.")
+            except Exception: pass
+
+    elif data == "menu":
+        reset_state(uid); await query.answer(); await safe_edit(message, WELCOME_TEXT, reply_markup=main_keyboard(uid))
+    elif data == "newmenu":
+        reset_state(uid); await query.answer(); await send_welcome(message, uid)
+    elif data == "close":
+        await query.answer()
+        try: await message.delete()
+        except Exception: pass
+    elif data == "help":
+        await query.answer(); await safe_edit(message, HELP_TEXT, reply_markup=NAV_KEYBOARD)
+    elif data == "history":
+        await query.answer(); await safe_edit(message, await build_history_text(uid), reply_markup=NAV_KEYBOARD)
+    elif data == "stop":
+        task = active_tasks.get(uid)
+        if task and not task.done():
+            task.cancel(); user_states[uid] = {"stage": "idle"}; await query.answer("🛑 Deteniendo la operación…")
+        else: await query.answer("No hay ninguna operación en curso.", show_alert=True)
+    elif data == "reset":
+        reset_state(uid); await query.answer("Cancelado."); await safe_edit(message, "🛑 **Cancelado.**\n\nVolvé al menú cuando quieras.", reply_markup=HOME_KEYBOARD)
+    elif data == "mode_rename":
+        reset_state(uid); user_states[uid] = {"stage": "rename_wait_file", "mode": "rename"}; await query.answer
