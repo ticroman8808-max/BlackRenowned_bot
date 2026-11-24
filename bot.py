@@ -97,6 +97,53 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+async def is_user_allowed(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    doc = await asyncio.to_thread(
+        users_collection.find_one,
+        {"user_id": user_id},
+        {"access_status": 1}
+    )
+    return bool(doc and doc.get("access_status") == "approved")
+
+
+async def set_user_access_status(user_id: int, status: str):
+    await asyncio.to_thread(
+        users_collection.update_one,
+        {"user_id": user_id},
+        {"$set": {"access_status": status}, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+        True
+    )
+
+
+def approval_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        btn("✅ Aprobar", f"auth_approve:{user_id}"),
+        btn("❌ Rechazar", f"auth_reject:{user_id}"),
+    ]])
+
+
+async def send_access_request(user):
+    uid = user.id
+    mention = user.mention if getattr(user, "mention", None) else f"ID {uid}"
+    text = (
+        "🔐 **Solicitud de acceso**\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Usuario: {mention}\n"
+        f"🆔 ID: `{uid}`"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                reply_markup=approval_keyboard(uid)
+            )
+        except Exception:
+            logger.warning("No se pudo enviar solicitud de acceso a admin %s", admin_id, exc_info=True)
+
+
 def main_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [btn("✏️ Renombrar", "mode_rename"), btn("🖼️ Miniatura + PDF", "mode_full")],
@@ -696,6 +743,10 @@ async def start_command(client: Client, message: Message):
         await db_upsert_user(message.from_user)
     except Exception:
         logger.exception("No se pudo registrar al usuario en MongoDB")
+    if not await is_user_allowed(uid):
+        await send_access_request(message.from_user)
+        await message.reply_text("🔒 Tu acceso está pendiente de aprobación por el administrador.")
+        return
     reset_state(uid)
     await send_welcome(message, uid)
 
@@ -705,6 +756,10 @@ async def cancel_command(client: Client, message: Message):
     if not message.from_user:
         return
     uid = message.from_user.id
+    if not await is_user_allowed(uid):
+        await send_access_request(message.from_user)
+        await message.reply_text("🔒 Tu acceso está pendiente de aprobación por el administrador.")
+        return
     task = active_tasks.get(uid)
     if task and not task.done():
         task.cancel()
@@ -717,6 +772,10 @@ async def finish_batch_command(client: Client, message: Message):
     if not message.from_user:
         return
     uid = message.from_user.id
+    if not await is_user_allowed(uid):
+        await send_access_request(message.from_user)
+        await message.reply_text("🔒 Tu acceso está pendiente de aprobación por el administrador.")
+        return
     error = finish_batch_stage(uid)
     if error:
         await message.reply_text(error)
@@ -728,8 +787,13 @@ async def finish_batch_command(client: Client, message: Message):
 async def history_command(client: Client, message: Message):
     if not message.from_user:
         return
+    uid = message.from_user.id
+    if not await is_user_allowed(uid):
+        await send_access_request(message.from_user)
+        await message.reply_text("🔒 Tu acceso está pendiente de aprobación por el administrador.")
+        return
     await message.reply_text(
-        await build_history_text(message.from_user.id), reply_markup=NAV_KEYBOARD
+        await build_history_text(uid), reply_markup=NAV_KEYBOARD
     )
 
 
@@ -767,6 +831,35 @@ async def callback_handler(client: Client, query: CallbackQuery):
     message = query.message
     if message is None:
         await query.answer("Este mensaje ya no está disponible. Escribí /start.", show_alert=True)
+        return
+
+    if data.startswith(("auth_approve:", "auth_reject:")):
+        if not is_admin(uid):
+            await query.answer("Acceso denegado.", show_alert=True)
+            return
+        action, target_id_str = data.split(":", 1)
+        target_id = int(target_id_str)
+        if action == "auth_approve":
+            await set_user_access_status(target_id, "approved")
+            await safe_edit(message, f"{message.text or ''}\n\nEstado: ✅ Aprobado")
+            await query.answer("Usuario aprobado.")
+            try:
+                await bot.send_message(target_id, "✅ Tu acceso fue aprobado. Escribí /start para usar el bot.")
+            except Exception:
+                pass
+        else:
+            await set_user_access_status(target_id, "rejected")
+            await safe_edit(message, f"{message.text or ''}\n\nEstado: ❌ Rechazado")
+            await query.answer("Usuario rechazado.")
+            try:
+                await bot.send_message(target_id, "❌ Tu solicitud de acceso fue rechazada.")
+            except Exception:
+                pass
+        return
+
+    if not await is_user_allowed(uid):
+        await send_access_request(query.from_user)
+        await query.answer("🔒 Tu acceso está pendiente de aprobación por el administrador.", show_alert=True)
         return
 
     # ----- Navegación -----
@@ -939,6 +1032,10 @@ async def text_handler(client: Client, message: Message):
     if not message.from_user:
         return
     uid = message.from_user.id
+    if not await is_user_allowed(uid):
+        await send_access_request(message.from_user)
+        await message.reply_text("🔒 Tu acceso está pendiente de aprobación por el administrador.")
+        return
     state = user_states.get(uid, {})
     stage = state.get("stage")
 
@@ -995,6 +1092,10 @@ async def media_handler(client: Client, message: Message):
     if not message.from_user:
         return
     uid = message.from_user.id
+    if not await is_user_allowed(uid):
+        await send_access_request(message.from_user)
+        await message.reply_text("🔒 Tu acceso está pendiente de aprobación por el administrador.")
+        return
     state = user_states.get(uid, {})
     stage = state.get("stage")
 
@@ -1274,12 +1375,7 @@ KtoSrdxWjd4CPlY3dKsG3ze4l+QXKwTg7iR3SHdHdHdMdxQ7ihvUNxi/Aj9eVmNyhvUO4od0x3h3SHcS
 LG7i97cW1fJR7fAsWLFixYsXzUVH0T+3J325JBeQw3+jjd80L4rRtPw2LFjcNw3C+Tv6ckHuLgZWCP4Tfz3D6p9+TvwK6H1a/UON
 7uaF8DKyUnYfxHP05IVtVW4VwMtwuvgt/OWraXVPvye9/gGfBrq43vHsfFtzgpO4tnxFfrzZVQMgaBR9fcflHwEft8wzolHuPxO/
 t574F7tcFtksjI0nxbXwcIxW9KmTFH5f/8QAMxEAAgEDAwMEAQAIBwAAAAAAAAECAxESBBMxECEwIEFQUUAFFCIjMmBhcDNCUoGR
-obH/2gAIAQMBAT8B8dxzHUHVN43jeN43jeFVFUFL5K45EqhKqSqDqGZmZGRmZiqEahCZGXyMmTkTmNt8Emo/xG7H6N76RuyN2RuS
-+zdl9iqyFW+0RafeJCRCQn+JcuZGZmZmZmZF/wAJkyoypNR5JVpS7eKEsXcpVFLggyLF+E2OQ6g6pum6bxvCrCrCqiqCkX87Jmon
-tq43d3fkpzcJZIh9kBfgtkmTmSmQak7MnGUXYuyUXE7nczFUI1CFQjIT8zJmtlZKPm0zypoiL8GTJyKj7XZKrD7HVXsidRyN2f2N
-t89VUfuZwIzXsRkQkRYvKyRr48P1+3r0kcaaI/gskTY213Kri3+z4tO3J2I9iAvNJH6QdoqPrRiW9MVayI/gskVpxgryJ1JTd340
-7d0aarn2ZAj5mVqSqKzJKzt6l1kuseRckRzUeSM1Lj0XHNLkTv1bS5IzUuOraQ6sF7iqxfAzU0KeLm138ul/xCDIi8zRqIONRp+t
-Po+lijH94iLFwTqZyxUrFOq6atLk09V1H0q3wdjT1JT4X/ZqVOMbtI0F3C76V6u37lbWPG1zTahpdyjLKN+mpqdrITk/oozlCXf/
+obH/2gAIAQMBAT8B8dxzHUHVN43jeN43jeFVFUFL5K45EqhKqSqDqGZmZGRmZiqEahCZGXyMmTkTmNt8Emo/xG7H6N76RuyN2RuS+zdl9iqyFW+0RafeJCRCQn+JcuZGZmZmZmZF/wAJkyoypNR5JVpS7eKEsXcpVFLggyLF+E2OQ6g6pum6bxvCrCrCqiqCkX87Jmontq43d3fkpzcJZIh9kBfgtkmTmSmQak7MnGUXYuyUXE7nczFUI1CFQjIT8zJmtlZKPm0zypoiL8GTJyKj7XZKrD7HVXsidRyN2f2Nt89VUfuZwIzXsRkQkRYvKyRr48P1+3r0kcaaI/gskTY213Kri3+z4tO3J2I9iAvNJH6QdoqPrRiW9MVayI/gskVpxgryJ1JTd3407d0aarn2ZAj5mVqSqKzJKzt6l1kuseRckRzUeSM1Lj0XHNLkTv1bS5IzUuOraQ6sF7iqxfAzU0KeLm138ul/xCDIi8zRqIONRp+tPo+lijH94iLFwTqZyxUrFOq6atLk09V1H0q3wdjT1JT4X/ZqVOMbtI0F3C76V6u37lbWPG1zTahpdyjLKN+mpqdrITk/oozlCXf/
 AMIyyRVhlFxGreTT1MJpsiiIvMzX6fKOa9vXHo2JliDtJMvZkZGpcr/wlHRyl3q/8EUoqyLnJS09SDfYq6WrUVuxQhhCz6arixV0
 7xyqdj9HK1O5cuVdPKcrqR+qS95n6iv9TIRxjYZqdFk8oDVuz8mneUEyP4DNXp9t5Lj1JDfSPVz4ZGoRqm6bpum6bhuG4ZjqEppm
 4l2RvCrCqiqCkX6OJqau5LjxIUW3ZFCOEFEj5LmQ5DqEqhOSkrMqQwlb05dY9VNNWO6FM3DcNw3DdN03jdHVHUHMzFMVQjVI1SNU
@@ -1356,7 +1452,7 @@ ZH+qqdDPea4ePv3zELnDvblW2T/pj/1XM2dgPE4nTddsyDqP4J8Mgo5hofe3Z6SO1Wkco54qGHIK60AA
 cGga8kLsntonRu6zTQ+9+HQNJyqEHNyI1DNH1g4IO4iqZM3F96gG5MlGThVGQZTC97201MNeKubNg6knmFBIN7Ai4f4bg5Osbziz
 FnkhOM4T+3uXXs2ez8dsakvmE+E5xu/ZPif1XihWOcT6HxCLc2StT4X5sNPfeE7nbJ1Jvom3jRkuwdEVrAwcLrvNGyvO3Fl4hMtr
 B1tl/aOPuM14zaapkg9poKskOHPOodFpHwKoTHn0jdl6dBKKtcmcQcD3wp8Nwd7s4eujRGN8ewjdPoaAeainHtNUsYzc0hFjhRzT
-QhAO9FLsu0WbLluU2DwT4zQl0dP2Racxh6ph2LkslkslksumyWSyWSyWSy0Z+tU166LTE44XeUT5Dm4kp1ikOe0zRafnKs7DkXjQ
+QhAO9FLsu0WbLluU2DwT4zQl0dP2Racxh6ph2LkslkslksumyWSyWSyWSyWS0Z+tU166LTE44XeUT5Dm4kp1ikOe0zRafnKs7DkXjQ
 5jTswi6FZ3nMsCloNl+2PVcfd+gz01DiPLQ2Rho5pqFHOPbFVaWnvVUDuDwinwtc52Fau3rk98TrqZamjGLB3l0mKwWPvDTUoM9N
 GrHSzwcUT32Aph+IaA6nWYFPD3heCmdP6O6QenwWPvL4at2OeRg4NKEk8jnuAoK6BHsSNGV8ZJhlDNjK6FHM87GTkyGzuJhbiTxP
 QY62Cx0YLH3hpreKvO08AsPUsNTH3lqdFVU6fAeqFYe8QVSqnT4IaKDM+sYer7SyW9ZldZblkuqVkelyKyWRWXqHVK6q3LrLM6Nk
