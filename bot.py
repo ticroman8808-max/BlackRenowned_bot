@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gc
 import logging
 import os
 import re
@@ -18,18 +19,21 @@ from pyrogram.errors import MessageNotModified
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN (NORTHFLANK)
 # ============================================================
-def required_env(name: str) -> str:
+def required_env(name: str, fallback: str | None = None) -> str:
     value = os.getenv(name, "").strip()
+    if not value and fallback:
+        value = os.getenv(fallback, "").strip()
     if not value:
         raise RuntimeError(f"Falta la variable de entorno obligatoria: {name}")
     return value
 
+
 API_ID = int(required_env("API_ID"))
 API_HASH = required_env("API_HASH")
 BOT_TOKEN = required_env("BOT_TOKEN")
-MONGO_URI = required_env("MONGO_URI")
+MONGO_URI = required_env("MONGO_URI", fallback="DATABASE_URL")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "BlackRenowned").strip() or "BlackRenowned"
 
 ADMIN_IDS = {
@@ -41,8 +45,8 @@ MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 TMP_ROOT = Path(os.getenv("TMP_DIR", "/tmp/blackrenowned"))
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Imagen de bienvenida: va incluida al final de este archivo (WELCOME_IMAGE_B64).
-# Video de bienvenida: colocar Bienvenida.mp4 junto a bot.py en el despliegue.
+# Imagen de bienvenida: incluida en WELCOME_IMAGE_B64.
+# Video de bienvenida: colocar Bienvenida.mp4 junto a bot.py en Northflank.
 WELCOME_IMAGE: Path | None = None
 WELCOME_VIDEO = Path(__file__).resolve().parent / "Bienvenida.mp4"
 # Zona horaria para las fechas del historial (Argentina = -3).
@@ -59,7 +63,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BlackRenowned")
 
-# MongoDB: operaciones síncronas de PyMongo se ejecutan con asyncio.to_thread.
 mongo_client = MongoClient(
     MONGO_URI,
     serverSelectionTimeoutMS=10000,
@@ -83,7 +86,7 @@ user_states: dict[int, dict] = {}
 active_tasks: dict[int, asyncio.Task] = {}
 last_progress_edit: dict[int, float] = {}
 
-# Máximo de archivos procesándose a la vez (cuida RAM y disco en Render).
+# Máximo de archivos procesándose a la vez (cuida RAM y disco en Northflank).
 PROCESS_SEMAPHORE = asyncio.Semaphore(2)
 
 
@@ -101,8 +104,9 @@ def is_admin(user_id: int) -> bool:
 def main_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [btn("✏️ Renombrar", "mode_rename"), btn("🖼️ Miniatura + PDF", "mode_full")],
-        [btn("📚 Lote de archivos", "mode_batch"), btn("📜 Historial", "history")],
-        [btn("ℹ️ Ayuda", "help"), btn("✖️ Cerrar", "close")],
+        [btn("📚 Multi-PDF + Imagen", "mode_multithumb"), btn("📦 Lote de archivos", "mode_batch")],
+        [btn("📜 Historial", "history"), btn("ℹ️ Ayuda", "help")],
+        [btn("✖️ Cerrar", "close")],
     ]
     if user_id is not None and is_admin(user_id):
         rows.append([btn("🛡️ Panel admin", "admin")])
@@ -116,6 +120,13 @@ CANCEL_KEYBOARD = InlineKeyboardMarkup([[btn("✖️ Cancelar", "reset")]])
 KEEPNAME_KEYBOARD = InlineKeyboardMarkup([
     [btn("📄 Conservar nombre original", "keepname")],
     [btn("✖️ Cancelar", "reset")],
+])
+MULTIPDF_NAME_KEYBOARD = InlineKeyboardMarkup([
+    [btn("✏️ Cambiar nombre", "mpdf_rename"), btn("📄 Dejar nombre actual", "mpdf_keep")],
+    [btn("🏁 Terminar sesión", "reset")],
+])
+MULTIPDF_ACTIVE_KEYBOARD = InlineKeyboardMarkup([
+    [btn("🏁 Terminar sesión", "reset")],
 ])
 META_KEYBOARD = InlineKeyboardMarkup([
     [btn("⏭️ Omitir metadatos", "skipmeta")],
@@ -140,6 +151,7 @@ RESTART_CONFIRM_KEYBOARD = InlineKeyboardMarkup([
     [btn("✅ Sí, reiniciar", "restart_yes"), btn("↩️ No", "admin")],
 ])
 
+
 def access_decision_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         btn("✅ ACEPTAR", f"access_approve:{user_id}"),
@@ -151,15 +163,16 @@ def access_list_keyboard(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboa
     rows.append([btn("⬅️ Panel admin", "admin")])
     return InlineKeyboardMarkup(rows)
 
+
 WELCOME_TEXT = (
     "🖤 **BLACK RENOWNED BOT**\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "Renombrá y personalizá tus archivos de forma rápida y prolija.\n\n"
     "✦ Renombrar cualquier archivo\n"
-    "✦ Miniatura personalizada\n"
-    "✦ Metadatos para PDF\n"
+    "✦ Miniatura personalizada + metadatos PDF\n"
+    "✦ Multi-PDF con una misma imagen (elegí nombre o dejá el actual)\n"
     "✦ Procesamiento por lotes\n"
-    "✦ Progreso en tiempo real\n\n"
+    "✦ Limpieza inmediata de temporales y RAM\n\n"
     "Elegí una opción 👇"
 )
 
@@ -167,8 +180,9 @@ HELP_TEXT = (
     "ℹ️ **Ayuda**\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "✏️ **Renombrar:** enviás el archivo y el nuevo nombre.\n"
-    "🖼️ **Miniatura + PDF:** elegís una portada y, si querés, metadatos.\n"
-    "📚 **Lote:** varios archivos con un prefijo común.\n\n"
+    "🖼️ **Miniatura + PDF:** elegís portada y, si querés, metadatos.\n"
+    "📚 **Multi-PDF + Imagen:** mandás 1 imagen y procesás varios PDFs eligiendo en cada uno si cambiás el nombre o dejás el que tiene.\n"
+    "📦 **Lote:** varios archivos con un prefijo común.\n\n"
     "🛑 Podés detener cualquier operación con el botón del progreso o con /cancel.\n"
     "🏠 Si algo se traba, /start vuelve al menú."
 )
@@ -185,7 +199,7 @@ META_TEXT = (
 
 
 # ============================================================
-# UTILIDADES
+# UTILIDADES Y LIMPIEZA ESTRICTA DE RAM / DISCO
 # ============================================================
 def md_safe(text: str) -> str:
     """Evita que un acento grave rompa el formato markdown."""
@@ -231,6 +245,14 @@ def media_name(message: Message) -> str:
     else:
         ext = ".bin"
     return f"archivo_{message.id}{ext}"
+
+
+def is_pdf_message(message: Message) -> bool:
+    if not message.document:
+        return False
+    mime = (message.document.mime_type or "").lower()
+    fname = (message.document.file_name or "").lower()
+    return mime == "application/pdf" or fname.endswith(".pdf")
 
 
 def clean_filename(name: str, fallback: str = "archivo") -> str:
@@ -290,19 +312,54 @@ async def update_progress(
         pass
 
 
-def cleanup_thumbnail(state: dict):
-    thumb = state.get("thumbnail")
-    if thumb:
+def remove_path_tree(path_str: str | Path | None):
+    if not path_str:
+        return
+    p = Path(path_str)
+    try:
+        if p.is_file() or p.is_symlink():
+            p.unlink(missing_ok=True)
+            parent = p.parent
+            if parent != TMP_ROOT and parent.exists() and not any(parent.iterdir()):
+                shutil.rmtree(parent, ignore_errors=True)
+        elif p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        logger.debug("Error limpiando ruta temporal %s", p, exc_info=True)
+
+
+def cleanup_thumbnail(state: dict, force: bool = False):
+    thumb = state.pop("thumbnail", None)
+    if not thumb:
+        return
+    if force or not state.get("keep_thumbnail_session"):
         folder = Path(thumb).parent
-        if folder.name.startswith("thumb_"):
+        if folder != TMP_ROOT and folder.name.startswith("thumb_"):
             shutil.rmtree(folder, ignore_errors=True)
+        else:
+            remove_path_tree(thumb)
 
 
-def reset_state(user_id: int):
-    """Vuelve al estado inicial. Si hay un proceso en marcha, éste limpia lo suyo."""
+def purge_user_ephemeral(user_id: int, force_thumb: bool = True):
+    """Limpia referencias de estado y memoria efímera del usuario."""
+    last_progress_edit.pop(user_id, None)
+    state = user_states.get(user_id)
+    if state:
+        cleanup_thumbnail(state, force=force_thumb)
+        state.pop("file_message", None)
+        state.pop("files", None)
+        state.pop("pending_pdf", None)
+        state.pop("new_name", None)
+        state.clear()
+    gc.collect()
+
+
+def reset_state(user_id: int, force_thumb: bool = True):
+    """Vuelve al estado inicial limpiando datos efímeros."""
     state = user_states.get(user_id, {})
     if state.get("stage") != "processing":
-        cleanup_thumbnail(state)
+        cleanup_thumbnail(state, force=force_thumb)
+    purge_user_ephemeral(user_id, force_thumb=force_thumb)
     user_states[user_id] = {"stage": "idle"}
 
 
@@ -315,8 +372,6 @@ def result_icon(result: str) -> str:
 
 
 async def db_upsert_user(user):
-    # Los usuarios nuevos quedan pendientes. Los registros antiguos sin estado
-    # conservan su acceso anterior (se migran como aprobados al consultarlos).
     await asyncio.to_thread(
         users_collection.update_one,
         {"user_id": user.id},
@@ -342,14 +397,14 @@ async def get_access_status(user_id: int) -> str | None:
         return None
     status = user_doc.get("access_status")
     if status is None:
-        # Los registros antiguos también deben pasar por aprobación manual:
-        # estar guardado en la base no concede acceso automáticamente.
         await asyncio.to_thread(
             users_collection.update_one,
             {"user_id": user_id, "access_status": {"$exists": False}},
-            {"$set": {"access_status": "pending",
-                      "access_requested_at": datetime.now(timezone.utc),
-                      "access_request_notified": False}}
+            {"$set": {
+                "access_status": "pending",
+                "access_requested_at": datetime.now(timezone.utc),
+                "access_request_notified": False
+            }}
         )
         return "pending"
     return str(status)
@@ -366,8 +421,10 @@ async def notify_admins_access_request(user):
     await asyncio.to_thread(
         users_collection.update_one,
         {"user_id": user.id, "access_status": "pending"},
-        {"$set": {"access_request_notified": True,
-                  "access_requested_at": datetime.now(timezone.utc)}}
+        {"$set": {
+            "access_request_notified": True,
+            "access_requested_at": datetime.now(timezone.utc)
+        }}
     )
     label = f"@{user.username}" if user.username else (user.first_name or "Sin nombre")
     text = (
@@ -381,8 +438,7 @@ async def notify_admins_access_request(user):
         try:
             await bot.send_message(admin_id, text, reply_markup=access_decision_keyboard(user.id))
         except Exception:
-            logger.warning("No se pudo notificar la solicitud al administrador %s", admin_id,
-                           exc_info=True)
+            logger.warning("No se pudo notificar la solicitud al administrador %s", admin_id, exc_info=True)
 
 
 async def build_access_list(status: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -480,7 +536,7 @@ async def build_admin_text() -> str:
 
 
 def prepare_welcome_image() -> Path | None:
-    """Devuelve la ruta de la imagen de bienvenida (la incluida en el código u otra propia)."""
+    """Devuelve la ruta de la imagen de bienvenida."""
     custom = os.getenv("WELCOME_IMAGE", "").strip()
     if custom:
         path = Path(__file__).resolve().parent / custom
@@ -549,6 +605,7 @@ async def make_thumbnail_jpeg(source: str, destination: str):
                 if os.path.getsize(destination) < 200 * 1024:
                     return
         raise ValueError("La miniatura convertida supera 200 KB. Elegí otra imagen.")
+
     await asyncio.to_thread(convert)
     return destination
 
@@ -601,7 +658,7 @@ def parse_metadata(text: str) -> dict:
 
 
 # ============================================================
-# PROCESAMIENTO DE ARCHIVOS
+# PROCESAMIENTO DE ARCHIVOS (LIMPIEZA INMEDIATA DE RAM / DISCO)
 # ============================================================
 async def download_and_send(
     user_id: int,
@@ -610,7 +667,9 @@ async def download_and_send(
     mode: str,
     thumbnail: str | None = None,
     metadata: dict | None = None,
-    position: tuple[int, int] | None = None
+    position: tuple[int, int] | None = None,
+    keep_thumbnail_after: bool = False,
+    on_complete_callback=None
 ):
     workdir = Path(tempfile.mkdtemp(prefix=f"user_{user_id}_", dir=TMP_ROOT))
     tag = f" ({position[0]}/{position[1]})" if position else ""
@@ -691,8 +750,10 @@ async def download_and_send(
             await save_history(user_id, original_name, actual_name, mode, size, "success")
             await safe_edit(
                 status, f"✅ **¡Listo!**{tag}\n\nTu archivo está arriba.",
-                reply_markup=HOME_KEYBOARD
+                reply_markup=MULTIPDF_ACTIVE_KEYBOARD if keep_thumbnail_after else HOME_KEYBOARD
             )
+            if on_complete_callback:
+                await on_complete_callback()
     except asyncio.CancelledError:
         await safe_edit(status, "🛑 **Operación detenida.**", reply_markup=HOME_KEYBOARD)
         await save_history(user_id, original_name, new_name, mode, size, "cancelled")
@@ -706,14 +767,19 @@ async def download_and_send(
         )
         await save_history(user_id, original_name, new_name, mode, size, f"error: {str(exc)[:300]}")
     finally:
+        # Borrado inmediato del archivo descargado y carpeta de trabajo.
         shutil.rmtree(workdir, ignore_errors=True)
-        if thumbnail:
+        last_progress_edit.pop(user_id, None)
+        if thumbnail and not keep_thumbnail_after:
             thumb_dir = Path(thumbnail).parent
-            if thumb_dir.exists() and thumb_dir.name.startswith("thumb_"):
+            if thumb_dir != TMP_ROOT and thumb_dir.exists() and thumb_dir.name.startswith("thumb_"):
                 shutil.rmtree(thumb_dir, ignore_errors=True)
+            else:
+                remove_path_tree(thumbnail)
+        gc.collect()
 
 
-def start_task(user_id: int, coroutine):
+def start_task(user_id: int, coroutine, after_done=None):
     old = active_tasks.get(user_id)
     if old and not old.done():
         old.cancel()
@@ -723,22 +789,90 @@ def start_task(user_id: int, coroutine):
     def cleanup(done_task):
         if active_tasks.get(user_id) is done_task:
             active_tasks.pop(user_id, None)
-        if user_states.get(user_id, {}).get("stage") == "processing":
-            user_states[user_id] = {"stage": "idle"}
+        if after_done:
+            after_done()
+        gc.collect()
+
     task.add_done_callback(cleanup)
 
 
 def launch_rename(user_id: int, original: Message, new_name: str):
     user_states[user_id] = {"stage": "processing", "mode": "rename"}
-    start_task(user_id, download_and_send(user_id, original, new_name, "rename"))
+
+    def finish_cb():
+        purge_user_ephemeral(user_id, force_thumb=True)
+        user_states[user_id] = {"stage": "idle"}
+
+    start_task(user_id, download_and_send(user_id, original, new_name, "rename"), after_done=finish_cb)
 
 
 def launch_full(user_id: int, state: dict, metadata: dict):
-    original = state["file_message"]
-    new_name = state["new_name"]
+    original = state.get("file_message")
+    new_name = state.get("new_name", "")
     thumbnail = state.get("thumbnail")
     user_states[user_id] = {"stage": "processing", "mode": "full"}
-    start_task(user_id, download_and_send(user_id, original, new_name, "full", thumbnail, metadata))
+
+    def finish_cb():
+        purge_user_ephemeral(user_id, force_thumb=True)
+        user_states[user_id] = {"stage": "idle"}
+
+    start_task(
+        user_id,
+        download_and_send(user_id, original, new_name, "full", thumbnail, metadata),
+        after_done=finish_cb
+    )
+
+
+def launch_multithumb_pdf(user_id: int, pdf_message: Message, final_name: str, thumbnail: str):
+    processed_count = user_states.get(user_id, {}).get("processed_count", 0)
+    user_states[user_id] = {
+        "stage": "processing",
+        "mode": "multithumb",
+        "thumbnail": thumbnail,
+        "keep_thumbnail_session": True,
+        "processed_count": processed_count,
+    }
+
+    async def after_send_prompt():
+        count = processed_count + 1
+        user_states[user_id] = {
+            "stage": "multithumb_wait_pdf",
+            "mode": "multithumb",
+            "thumbnail": thumbnail,
+            "keep_thumbnail_session": True,
+            "processed_count": count,
+        }
+        await bot.send_message(
+            user_id,
+            f"🖼️ **Miniatura activa ({count} PDF listo)**\n\n"
+            "Enviame el **siguiente PDF** para usar esta misma imagen, o tocá **Terminar sesión** para limpiar todo.",
+            reply_markup=MULTIPDF_ACTIVE_KEYBOARD
+        )
+
+    def finish_cb():
+        if user_states.get(user_id, {}).get("stage") == "processing":
+            user_states[user_id] = {
+                "stage": "multithumb_wait_pdf",
+                "mode": "multithumb",
+                "thumbnail": thumbnail,
+                "keep_thumbnail_session": True,
+                "processed_count": processed_count + 1,
+            }
+        gc.collect()
+
+    start_task(
+        user_id,
+        download_and_send(
+            user_id,
+            pdf_message,
+            final_name,
+            "multithumb",
+            thumbnail=thumbnail,
+            keep_thumbnail_after=True,
+            on_complete_callback=after_send_prompt
+        ),
+        after_done=finish_cb
+    )
 
 
 def launch_batch(user_id: int, files: list, prefix: str):
@@ -756,14 +890,18 @@ def launch_batch(user_id: int, files: list, prefix: str):
                 user_id, item, final_name, "batch", position=(index, total)
             )
 
-    start_task(user_id, process_batch())
+    def finish_cb():
+        purge_user_ephemeral(user_id, force_thumb=True)
+        user_states[user_id] = {"stage": "idle"}
+
+    start_task(user_id, process_batch(), after_done=finish_cb)
 
 
 def finish_batch_stage(user_id: int) -> str | None:
     """Pasa el lote a la etapa de prefijo. Devuelve un error en texto, o None si salió bien."""
     state = user_states.get(user_id, {})
     if state.get("stage") != "batch_collect":
-        return "No hay un lote pendiente. Elegí 📚 Lote de archivos en el menú."
+        return "No hay un lote pendiente. Elegí 📦 Lote de archivos en el menú."
     if not state.get("files"):
         return "Todavía no recibí archivos para el lote."
     state["stage"] = "batch_prefix"
@@ -784,7 +922,7 @@ def prefix_prompt(user_id: int) -> str:
 # REINICIO Y VIGILANTE
 # ============================================================
 def restart_process(reason: str):
-    """Cierra el proceso. Render lo vuelve a levantar solo en unos segundos."""
+    """Cierra el proceso. Northflank lo levanta automáticamente."""
     logger.warning("Reiniciando el bot. Motivo: %s", reason)
     os._exit(1)
 
@@ -794,7 +932,6 @@ async def watchdog():
     failures = 0
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL)
-        # Con archivos en proceso la conexión puede estar ocupada: no se mide.
         if any(not task.done() for task in active_tasks.values()):
             failures = 0
             continue
@@ -864,8 +1001,8 @@ async def cancel_command(client: Client, message: Message):
     task = active_tasks.get(uid)
     if task and not task.done():
         task.cancel()
-    reset_state(uid)
-    await message.reply_text("🛑 **Operación detenida.**", reply_markup=HOME_KEYBOARD)
+    reset_state(uid, force_thumb=True)
+    await message.reply_text("🛑 **Operación detenida y memoria limpia.**", reply_markup=HOME_KEYBOARD)
 
 
 @bot.on_message(filters.command("finish"))
@@ -936,8 +1073,11 @@ async def callback_handler(client: Client, query: CallbackQuery):
             return
 
         if data in ("access_pending", "access_allowed", "access_blocked"):
-            status_key = {"access_pending": "pending", "access_allowed": "allowed",
-                          "access_blocked": "blocked"}[data]
+            status_key = {
+                "access_pending": "pending",
+                "access_allowed": "allowed",
+                "access_blocked": "blocked"
+            }[data]
             text, keyboard = await build_access_list(status_key)
             await query.answer()
             await safe_edit(message, text, reply_markup=keyboard)
@@ -962,7 +1102,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
                 running_task = active_tasks.get(target_id)
                 if running_task and not running_task.done():
                     running_task.cancel()
-                reset_state(target_id)
+                reset_state(target_id, force_thumb=True)
             if result.matched_count == 0:
                 await query.answer("No se encontró ese usuario.", show_alert=True)
                 return
@@ -977,23 +1117,25 @@ async def callback_handler(client: Client, query: CallbackQuery):
                 logger.info("No se pudo notificar el cambio de acceso al usuario %s", target_id)
             label = {"approve": "aprobado", "reject": "rechazado", "revoke": "revocado"}[action]
             await query.answer(f"Acceso {label}.")
-            await safe_edit(message, f"✅ Acceso **{label}** para el usuario `{target_id}`.",
-                            reply_markup=InlineKeyboardMarkup([[btn("⬅️ Panel admin", "admin")]]))
+            await safe_edit(
+                message,
+                f"✅ Acceso **{label}** para el usuario `{target_id}`.",
+                reply_markup=InlineKeyboardMarkup([[btn("⬅️ Panel admin", "admin")]])
+            )
             return
 
-    # Toda interacción funcional requiere autorización.
     if not await is_authorized(uid):
         await query.answer("No tenés autorización. Escribí /start para consultar tu acceso.", show_alert=True)
         return
 
     # ----- Navegación -----
     if data == "menu":
-        reset_state(uid)
+        reset_state(uid, force_thumb=True)
         await query.answer()
         await safe_edit(message, WELCOME_TEXT, reply_markup=main_keyboard(uid))
 
     elif data == "newmenu":
-        reset_state(uid)
+        reset_state(uid, force_thumb=True)
         await query.answer()
         await send_welcome(message, uid)
 
@@ -1017,22 +1159,22 @@ async def callback_handler(client: Client, query: CallbackQuery):
         task = active_tasks.get(uid)
         if task and not task.done():
             task.cancel()
-            user_states[uid] = {"stage": "idle"}
+            reset_state(uid, force_thumb=True)
             await query.answer("🛑 Deteniendo la operación…")
         else:
             await query.answer("No hay ninguna operación en curso.", show_alert=True)
 
     elif data == "reset":
-        reset_state(uid)
-        await query.answer("Cancelado.")
+        reset_state(uid, force_thumb=True)
+        await query.answer("Listo, sesión cerrada y limpiada.")
         await safe_edit(
-            message, "🛑 **Cancelado.**\n\nVolvé al menú cuando quieras.",
+            message, "🛑 **Sesión cerrada y temporales borrados.**\n\nVolvé al menú cuando quieras.",
             reply_markup=HOME_KEYBOARD
         )
 
     # ----- Modos -----
     elif data == "mode_rename":
-        reset_state(uid)
+        reset_state(uid, force_thumb=True)
         user_states[uid] = {"stage": "rename_wait_file", "mode": "rename"}
         await query.answer()
         await safe_edit(
@@ -1045,7 +1187,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
         )
 
     elif data == "mode_full":
-        reset_state(uid)
+        reset_state(uid, force_thumb=True)
         user_states[uid] = {"stage": "full_wait_thumb", "mode": "full", "thumbnail": None}
         await query.answer()
         await safe_edit(
@@ -1060,13 +1202,34 @@ async def callback_handler(client: Client, query: CallbackQuery):
             reply_markup=NAV_KEYBOARD
         )
 
+    elif data == "mode_multithumb":
+        reset_state(uid, force_thumb=True)
+        user_states[uid] = {
+            "stage": "multithumb_wait_thumb",
+            "mode": "multithumb",
+            "thumbnail": None,
+            "keep_thumbnail_session": True,
+            "processed_count": 0,
+        }
+        await query.answer()
+        await safe_edit(
+            message,
+            "📚 **Multi-PDF con una misma imagen**\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "1️⃣ Enviame **una imagen** (se reutiliza para todos los PDFs)\n"
+            "2️⃣ Enviame un **PDF**\n"
+            "3️⃣ Elegí si querés **cambiar el nombre** o **dejar el nombre actual**\n"
+            "4️⃣ Repetí con más PDFs o tocá **Terminar sesión**",
+            reply_markup=NAV_KEYBOARD
+        )
+
     elif data == "mode_batch":
-        reset_state(uid)
+        reset_state(uid, force_thumb=True)
         user_states[uid] = {"stage": "batch_collect", "mode": "batch", "files": []}
         await query.answer()
         await safe_edit(
             message,
-            "📚 **Procesamiento por lotes**\n"
+            "📦 **Procesamiento por lotes**\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "1️⃣ Enviame todos los archivos\n"
             "2️⃣ Tocá **Terminar lote** (o escribí /finish)\n"
@@ -1084,6 +1247,33 @@ async def callback_handler(client: Client, query: CallbackQuery):
         state["stage"] = "full_wait_metadata"
         await query.answer()
         await safe_edit(message, META_TEXT, reply_markup=META_KEYBOARD)
+
+    elif data == "mpdf_keep":
+        state = user_states.get(uid, {})
+        pdf_msg = state.get("pending_pdf")
+        thumb = state.get("thumbnail")
+        if state.get("stage") != "multithumb_choose_name" or not pdf_msg or not thumb:
+            await query.answer("Esta opción ya no está disponible.", show_alert=True)
+            return
+        orig_name = clean_filename(media_name(pdf_msg))
+        state.pop("pending_pdf", None)
+        await query.answer("Dejando nombre actual…")
+        await safe_edit(message, f"📄 Manteniendo `{md_safe(orig_name)}`…")
+        launch_multithumb_pdf(uid, pdf_msg, orig_name, thumb)
+
+    elif data == "mpdf_rename":
+        state = user_states.get(uid, {})
+        pdf_msg = state.get("pending_pdf")
+        if state.get("stage") != "multithumb_choose_name" or not pdf_msg:
+            await query.answer("Esta opción ya no está disponible.", show_alert=True)
+            return
+        state["stage"] = "multithumb_wait_name"
+        await query.answer()
+        await safe_edit(
+            message,
+            f"✏️ Escribí el **nuevo nombre** para `{md_safe(media_name(pdf_msg))}` (con o sin `.pdf`):",
+            reply_markup=MULTIPDF_ACTIVE_KEYBOARD
+        )
 
     elif data == "skipmeta":
         state = user_states.get(uid, {})
@@ -1169,6 +1359,19 @@ async def text_handler(client: Client, message: Message):
             requested += suffix
         launch_rename(uid, original, requested)
 
+    elif stage == "multithumb_wait_name":
+        pdf_msg = state.get("pending_pdf")
+        thumb = state.get("thumbnail")
+        if not pdf_msg or not thumb:
+            reset_state(uid, force_thumb=True)
+            await message.reply_text("📂 La sesión expiró. Elegí una opción:", reply_markup=main_keyboard(uid))
+            return
+        requested = clean_filename(message.text)
+        if not requested.lower().endswith(".pdf"):
+            requested += ".pdf"
+        state.pop("pending_pdf", None)
+        launch_multithumb_pdf(uid, pdf_msg, requested, thumb)
+
     elif stage == "full_wait_name":
         requested = clean_filename(message.text)
         original_suffix = Path(media_name(state["file_message"])).suffix
@@ -1195,6 +1398,18 @@ async def text_handler(client: Client, message: Message):
             reply_markup=BATCH_KEYBOARD
         )
 
+    elif stage == "multithumb_choose_name":
+        await message.reply_text(
+            "Elegí un botón: **Cambiar nombre** o **Dejar nombre actual**.",
+            reply_markup=MULTIPDF_NAME_KEYBOARD
+        )
+
+    elif stage == "multithumb_wait_pdf":
+        await message.reply_text(
+            "📄 Enviame el próximo **PDF** para usar la miniatura guardada, o tocá **Terminar sesión**.",
+            reply_markup=MULTIPDF_ACTIVE_KEYBOARD
+        )
+
     elif stage == "processing":
         await message.reply_text("⏳ Estoy procesando un archivo. Podés detenerlo con el botón 🛑 o con /cancel.")
 
@@ -1219,31 +1434,41 @@ async def media_handler(client: Client, message: Message):
     state = user_states.get(uid, {})
     stage = state.get("stage")
 
-    if stage == "full_wait_thumb":
+    if stage in ("full_wait_thumb", "multithumb_wait_thumb"):
         is_image = bool(message.photo) or (
             bool(message.document) and (message.document.mime_type or "").startswith("image/")
         )
         if not is_image:
-            await message.reply_text("🖼️ Necesito una imagen para la miniatura. Enviame una foto.")
+            await message.reply_text("🖼️ Necesito una imagen para la miniatura. Enviame una foto o imagen.")
             return
         folder = Path(tempfile.mkdtemp(prefix="thumb_", dir=TMP_ROOT))
         try:
             raw = await bot.download_media(message, file_name=str(folder / "source"))
             thumb_path = str(folder / "thumb.jpg")
             await make_thumbnail_jpeg(raw, thumb_path)
+            remove_path_tree(raw)
             state["thumbnail"] = thumb_path
-            state["stage"] = "full_wait_file"
-            await message.reply_text(
-                "✅ **Miniatura guardada.**\n\nAhora enviame el archivo que querés procesar.",
-                reply_markup=CANCEL_KEYBOARD
-            )
+            if stage == "full_wait_thumb":
+                state["stage"] = "full_wait_file"
+                await message.reply_text(
+                    "✅ **Miniatura guardada.**\n\nAhora enviame el archivo que querés procesar.",
+                    reply_markup=CANCEL_KEYBOARD
+                )
+            else:
+                state["stage"] = "multithumb_wait_pdf"
+                state["keep_thumbnail_session"] = True
+                await message.reply_text(
+                    "✅ **Miniatura lista para varios PDFs.**\n\n"
+                    "Enviame el primer **PDF**.",
+                    reply_markup=MULTIPDF_ACTIVE_KEYBOARD
+                )
         except Exception as exc:
             shutil.rmtree(folder, ignore_errors=True)
             await message.reply_text(f"❌ No pude preparar esa imagen: {md_safe(str(exc))[:300]}")
         return
 
     if not (message.document or message.video or message.audio or message.animation or message.voice or message.video_note):
-        await message.reply_text("Ese tipo de archivo no es compatible como archivo principal. Enviame un documento, video o audio.")
+        await message.reply_text("Ese tipo de archivo no es compatible. Enviame un documento, video o audio.")
         return
 
     size = media_size(message)
@@ -1251,7 +1476,21 @@ async def media_handler(client: Client, message: Message):
         await message.reply_text(f"❌ El archivo supera el límite configurado de {MAX_FILE_SIZE_MB} MB.")
         return
 
-    if stage == "rename_wait_file":
+    if stage == "multithumb_wait_pdf":
+        if not is_pdf_message(message):
+            await message.reply_text(
+                "📄 Este modo trabaja con archivos **PDF**. Enviame un PDF o tocá **Terminar sesión**.",
+                reply_markup=MULTIPDF_ACTIVE_KEYBOARD
+            )
+            return
+        state["pending_pdf"] = message
+        state["stage"] = "multithumb_choose_name"
+        await message.reply_text(
+            f"📄 PDF recibido: `{md_safe(media_name(message))}`\n\n"
+            "¿Querés cambiarle el nombre o dejar el que está puesto?",
+            reply_markup=MULTIPDF_NAME_KEYBOARD
+        )
+    elif stage == "rename_wait_file":
         state["file_message"] = message
         state["stage"] = "rename_wait_name"
         await message.reply_text(
@@ -1281,12 +1520,13 @@ async def media_handler(client: Client, message: Message):
 
 
 # ============================================================
-# SERVIDOR HTTP PARA RENDER
+# SERVIDOR HTTP PARA NORTHFLANK
 # ============================================================
 async def health(request):
     return web.json_response({
         "status": "ok",
         "service": "Black Renowned Bot",
+        "platform": "northflank",
         "uptime_seconds": int(time.time() - BOT_STARTED_AT)
     })
 
@@ -1308,7 +1548,6 @@ async def start_http_server():
 # ARRANQUE
 # ============================================================
 async def main():
-    # Verificar MongoDB antes de iniciar el bot (3 intentos).
     for attempt in range(1, 4):
         try:
             await asyncio.to_thread(mongo_client.admin.command, "ping")
@@ -1320,8 +1559,6 @@ async def main():
             await asyncio.sleep(5)
     logger.info("Conexión con MongoDB correcta.")
 
-    # Migrar los registros anteriores: ningún usuario obtiene acceso automático.
-    # El administrador debe aprobar individualmente a quienes quiera conservar.
     await asyncio.to_thread(
         users_collection.update_many,
         {"access_status": {"$exists": False}},
@@ -1351,11 +1588,12 @@ async def main():
         await bot.stop()
         await runner.cleanup()
         mongo_client.close()
+        shutil.rmtree(TMP_ROOT, ignore_errors=True)
+        gc.collect()
 
 
 # ============================================================
 # IMAGEN DE BIENVENIDA (incluida en el código)
-# No hace falta tocar esta parte.
 # ============================================================
 WELCOME_IMAGE_B64 = """
 /9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIj
@@ -1403,8 +1641,8 @@ jWTezOrbPTKpYnJixLs0wLi1TXIAAABegtUAPQPX/APf+e/Ou3p6unwnD/Q3xme/lltvRnTNbBM3nvr2
 quNz/raHybt8qMN6Db1AZsI6nLtUAAAAAAATAsiSqYAAAAAAAANj9KfmT9EY1T89/pf81H3/AKX+cvot59j89++3s9Pz3i9f81z2
 5U7GFqLY0ubteicTfn0+78T87ces8rzOGfp/nsPUr6D7/wCT89N7mAAAAAAAAAAAAAAAAAABO1qSb8YcwiRVMERbGbWzyan0O38n
 Y+qwcbcrNh3dleXl3yamfLVdLl/RZk+Hfb8OOImAAAAAAAAAACUSQAAAAAAACfdvCfZ837f88fofw6X5Ebz0PWvFbH6N+a+S9LPM
-db7D5iuPj+gpnt8LBeIBMFuryYJgAAAAAAAAAAAAAAAAAAAAGbCN9p7RMTBFbDFFoKxMCJ6Ry77mib27w4PrM/xm7X1uXndYrj6e
-5vPyfF9D5UeeU+45udfMs2GAAAAAAAAAAAAAAAAAHrvkX08es+C7vMAoB1OWPcOZ5J9ibLTtqfGjNTAmAAAAAAAAAAAAAAAAAAAA
+db7D5iuPj+gpnt8LBeIBMFuryYJgAAAAAAAAAAAAAAAAAAAAGbCN9p7RMTBFbDFFoKxMCJ6Ry77mib27w4PrM/xm7X1uXndYrj6e5v
+PyfF9D5UeeU+45udfMs2GAAAAAAAAAAAAAAAAAHrvkX08es+C7vMAoB1OWPcOZ5J9ibLTtqfGjNTAmAAAAAAAAAAAAAAAAAAAA
 AAAATA2Mulc2orYpXJQrFoKyg3djlQdvsfFyerafxv0Zi5X330h4THvvCPNd36Tjazvbfy/P0+1+Ww5F+ewfT4Od+fbeoAAAJiSE
 wAAAAJgSWKrQRFhVIiQRMAAAAAAAAEwAAAAAAAAkAARMAAAAAAAAAAAAAAE5MQ2p1LGasSItBWLQRFoKrQRkpB9L9H5sPXOj4nv2
 ewafxvY3jo4Niu8fJ63Y3ufb5/Z+ibnwnF9Z0MvNH0nzvO1CgASBEiEiAAJgZFLkJEJELYyAAAAAAAAAAAAAAAAASkQkQkQmCAAA
@@ -1509,8 +1747,8 @@ KtoSrdxWjd4CPlY3dKsG3ze4l+QXKwTg7iR3SHdHdHdMdxQ7ihvUNxi/Aj9eVmNyhvUO4od0x3h3SHcS
 LG7i97cW1fJR7fAsWLFixYsXzUVH0T+3J325JBeQw3+jjd80L4rRtPw2LFjcNw3C+Tv6ckHuLgZWCP4Tfz3D6p9+TvwK6H1a/UON
 7uaF8DKyUnYfxHP05IVtVW4VwMtwuvgt/OWraXVPvye9/gGfBrq43vHsfFtzgpO4tnxFfrzZVQMgaBR9fcflHwEft8wzolHuPxO/
 t574F7tcFtksjI0nxbXwcIxW9KmTFH5f/8QAMxEAAgEDAwMEAQAIBwAAAAAAAAECAxESBBMxECEwIEFQUUAFFCIjMmBhcDNCUoGR
-obH/2gAIAQMBAT8B8dxzHUHVN43jeN43jeFVFUFL5K45EqhKqSqDqGZmZGRmZiqEahCZGXyMmTkTmNt8Emo/xG7H6N76RuyN2RuS
-+zdl9iqyFW+0RafeJCRCQn+JcuZGZmZmZmZF/wAJkyoypNR5JVpS7eKEsXcpVFLggyLF+E2OQ6g6pum6bxvCrCrCqiqCkX87Jmon
+obH/2gAIAQMBAT8B8dxzHUHVN43jeN43jeFVFUFL5K45EqhKqSqDqGZmZGRmZiqEahCZGXyMmTkTmNt8Emo/xG7H6N76RuyN2RuS+
+zdl9iqyFW+0RafeJCRCQn+JcuZGZmZmZmZF/wAJkyoypNR5JVpS7eKEsXcpVFLggyLF+E2OQ6g6pum6bxvCrCrCqiqCkX87Jmon
 tq43d3fkpzcJZIh9kBfgtkmTmSmQak7MnGUXYuyUXE7nczFUI1CFQjIT8zJmtlZKPm0zypoiL8GTJyKj7XZKrD7HVXsidRyN2f2N
 t89VUfuZwIzXsRkQkRYvKyRr48P1+3r0kcaaI/gskTY213Kri3+z4tO3J2I9iAvNJH6QdoqPrRiW9MVayI/gskVpxgryJ1JTd340
 7d0aarn2ZAj5mVqSqKzJKzt6l1kuseRckRzUeSM1Lj0XHNLkTv1bS5IzUuOraQ6sF7iqxfAzU0KeLm138ul/xCDIi8zRqIONRp+t
@@ -1591,7 +1829,7 @@ ZH+qqdDPea4ePv3zELnDvblW2T/pj/1XM2dgPE4nTddsyDqP4J8Mgo5hofe3Z6SO1Wkco54qGHIK60AA
 cGga8kLsntonRu6zTQ+9+HQNJyqEHNyI1DNH1g4IO4iqZM3F96gG5MlGThVGQZTC97201MNeKubNg6knmFBIN7Ai4f4bg5Osbziz
 FnkhOM4T+3uXXs2ez8dsakvmE+E5xu/ZPif1XihWOcT6HxCLc2StT4X5sNPfeE7nbJ1Jvom3jRkuwdEVrAwcLrvNGyvO3Fl4hMtr
 B1tl/aOPuM14zaapkg9poKskOHPOodFpHwKoTHn0jdl6dBKKtcmcQcD3wp8Nwd7s4eujRGN8ewjdPoaAeainHtNUsYzc0hFjhRzT
-QhAO9FLsu0WbLluU2DwT4zQl0dP2Racxh6ph2LkslkslksumyWSyWSyWSy0Z+tU166LTE44XeUT5Dm4kp1ikOe0zRafnKs7DkXjQ
+QhAO9FLsu0WbLluU2DwT4zQl0dP2Racxh6ph2LkslkslksumyWSyWSyWSyWS0Z+tU166LTE44XeUT5Dm4kp1ikOe0zRafnKs7DkXjQ
 5jTswi6FZ3nMsCloNl+2PVcfd+gz01DiPLQ2Rho5pqFHOPbFVaWnvVUDuDwinwtc52Fau3rk98TrqZamjGLB3l0mKwWPvDTUoM9N
 GrHSzwcUT32Aph+IaA6nWYFPD3heCmdP6O6QenwWPvL4at2OeRg4NKEk8jnuAoK6BHsSNGV8ZJhlDNjK6FHM87GTkyGzuJhbiTxP
 QY62Cx0YLH3hpreKvO08AsPUsNTH3lqdFVU6fAeqFYe8QVSqnT4IaKDM+sYer7SyW9ZldZblkuqVkelyKyWRWXqHVK6q3LrLM6Nk
@@ -1921,6 +2159,6 @@ WELCOME_IMAGE = prepare_welcome_image()
 if __name__ == "__main__":
     # IMPORTANTE: se usa el mismo event loop con el que Pyrogram creó el cliente.
     # Con asyncio.run() el bot conecta pero no procesa ningún mensaje.
-    # Funciona con Python 3.11 (fijá PYTHON_VERSION=3.11.9 en Render).
+    # Funciona con Python 3.11 (fijá PYTHON_VERSION=3.11.9 en Northflank).
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
