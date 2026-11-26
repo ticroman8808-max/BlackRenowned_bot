@@ -1,7 +1,8 @@
-aiohttp==3.9.3
-pyrofork==2.3.43
+aiohttp==3.9.5
+pyrofork==2.3.45
 tgcrypto==1.2.5
 pymongo[srv]==4.6.3
 dnspython==2.6.1
-certifi==2024.2.2
-Pillow==10.4.0
+certifi==2024.7.4
+pillow==10.4.0
+PyMuPDF
