@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 import base64
 import gc
 import hashlib
@@ -12,7 +13,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import fitz  # PyMuPDF
 from aiohttp import web
 from PIL import Image
 from pymongo import MongoClient
@@ -56,6 +56,13 @@ LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET_HOURS", "-3"))))
 WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "120"))
 CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "180"))
 MAX_TEMP_AGE_SECONDS = int(os.getenv("MAX_TEMP_AGE_SECONDS", "240"))
+# Tope de lo que pueden ocupar los temporales a la vez (los 512 MB del hosting incluyen librerías y código).
+TEMP_BUDGET_MB = int(os.getenv("TEMP_BUDGET_MB", "250"))
+# Un PDF esperando que elijas nombre/miniatura se borra solo pasado este tiempo.
+PREVIEW_TTL_SECONDS = int(os.getenv("PREVIEW_TTL_SECONDS", "1200"))
+# Memoria máxima aproximada al decodificar la imagen de una miniatura, y peso máximo de la imagen que se manda.
+MAX_THUMB_SOURCE_MB = int(os.getenv("MAX_THUMB_SOURCE_MB", "70"))
+THUMB_MAX_DOWNLOAD_MB = int(os.getenv("THUMB_MAX_DOWNLOAD_MB", "25"))
 BOT_STARTED_AT = time.time()
 BOT_PAUSED = False
 
@@ -283,6 +290,26 @@ def remove_path_tree(path_str: str | Path | None):
         logger.debug("Error limpiando ruta temporal %s", p, exc_info=True)
 
 
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except Exception:
+    _LIBC = None
+_last_trim = 0.0
+
+
+def release_memory():
+    """Libera memoria sobrante: recolecta basura y devuelve al sistema lo que Python ya no usa."""
+    global _last_trim
+    gc.collect()
+    now = time.monotonic()
+    if _LIBC is not None and now - _last_trim > 5:
+        _last_trim = now
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
+
+
 def clear_state_files(state: dict):
     for key in ("thumbnail", "pdf_path", "workdir"):
         val = state.pop(key, None)
@@ -296,7 +323,7 @@ def purge_user_ephemeral(user_id: int):
     if state:
         clear_state_files(state)
         state.clear()
-    gc.collect()
+    release_memory()
 
 
 def reset_state(user_id: int):
@@ -337,15 +364,47 @@ def sweep_stale_temp_files(max_age_seconds: int = MAX_TEMP_AGE_SECONDS, force_al
         except Exception:
             logger.debug("No se pudo limpiar residuo %s", entry, exc_info=True)
     if removed:
-        gc.collect()
+        release_memory()
     return removed
+
+
+def temp_usage_bytes() -> int:
+    total = 0
+    if not TMP_ROOT.exists():
+        return 0
+    for root, _dirs, files in os.walk(TMP_ROOT):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def expire_idle_states() -> int:
+    """Borra los PDF que esperan una decisión del usuario hace demasiado tiempo."""
+    now = time.monotonic()
+    expired = 0
+    for uid, st in list(user_states.items()):
+        if st.get("stage") in ("pdf_ready", "waiting_name", "waiting_thumb") and st.get("pdf_path"):
+            ready_at = st.setdefault("ready_at", now)
+            if now - ready_at > PREVIEW_TTL_SECONDS:
+                clear_state_files(st)
+                st.clear()
+                st["stage"] = "idle"
+                expired += 1
+    return expired
 
 
 async def auto_cleaner_loop():
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL)
         try:
+            expired = expire_idle_states()
+            if expired:
+                logger.info("Vencieron %s PDF sin terminar; temporales borrados", expired)
             deleted = await asyncio.to_thread(sweep_stale_temp_files)
+            release_memory()
             if deleted:
                 logger.info("Autolimpieza: %s elementos residuales eliminados", deleted)
         except asyncio.CancelledError:
@@ -624,9 +683,26 @@ async def deny_unapproved(message: Message, user_id: int) -> bool:
     return True
 
 
+_BYTES_PER_PIXEL = {"1": 4, "L": 1, "P": 4, "RGB": 3, "LA": 4, "RGBA": 4}
+
+
 def _save_jpeg_thumb(pil_img: Image.Image, destination: str) -> str:
+    if pil_img.format == "JPEG":
+        # Decodifica el JPG directamente a escala reducida: ahorra muchísima memoria.
+        pil_img.draft("RGB", (640, 640))
+    else:
+        has_alpha = pil_img.mode in ("RGBA", "LA", "PA") or "transparency" in pil_img.info
+        per_pixel = _BYTES_PER_PIXEL.get(pil_img.mode, 4) * (2 if has_alpha else 1)
+        estimated_mb = pil_img.width * pil_img.height * per_pixel / (1024 * 1024)
+        if estimated_mb > MAX_THUMB_SOURCE_MB:
+            raise ValueError(
+                "La imagen es demasiado grande para procesarla en este servidor. "
+                "Mandala más chica o en formato JPG."
+            )
+    if pil_img.mode in ("P", "1"):
+        pil_img = pil_img.convert("RGB")
+    pil_img.thumbnail((320, 320))
     with pil_img.convert("RGB") as rgb:
-        rgb.thumbnail((320, 320))
         for quality in (82, 65, 50, 35):
             rgb.save(destination, "JPEG", quality=quality, optimize=True)
             if os.path.getsize(destination) < 200 * 1024:
@@ -647,6 +723,7 @@ async def extract_first_pdf_image_thumb(pdf_path: str, destination: str) -> tupl
     Si la 1.ª página no contiene imágenes incrustadas, renderiza la 1.ª página como respaldo.
     """
     def extract():
+        import fitz  # PyMuPDF (se carga solo cuando hace falta)
         doc = fitz.open(pdf_path)
         try:
             if len(doc) == 0:
@@ -654,11 +731,17 @@ async def extract_first_pdf_image_thumb(pdf_path: str, destination: str) -> tupl
             page = doc[0]
             imgs = page.get_images(full=True)
             if imgs:
-                base = doc.extract_image(imgs[0][0])
-                with Image.open(io.BytesIO(base["image"])) as img:
-                    _save_jpeg_thumb(img, destination)
-                return destination, "1.ª imagen del PDF"
-            pix = page.get_pixmap(dpi=100)
+                try:
+                    base = doc.extract_image(imgs[0][0])
+                    with Image.open(io.BytesIO(base["image"])) as img:
+                        _save_jpeg_thumb(img, destination)
+                    return destination, "1.ª imagen del PDF"
+                except Exception as exc:
+                    # Imagen ilegible o demasiado grande: se usa la página renderizada como respaldo.
+                    logger.info("No se pudo usar la 1.ª imagen del PDF (%s); se usa la página", exc)
+            longest = max(page.rect.width, page.rect.height) or 1
+            zoom = min(100 / 72, 1000 / longest)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
                 _save_jpeg_thumb(img, destination)
             return destination, "1.ª página del PDF"
@@ -689,6 +772,13 @@ async def prepare_pdf_preview(user_id: int, pdf_message: Message):
             if size and size > MAX_FILE_SIZE:
                 raise ValueError(f"El archivo supera el límite de {MAX_FILE_SIZE_MB} MB.")
 
+            used = await asyncio.to_thread(temp_usage_bytes)
+            if size and used + size > TEMP_BUDGET_MB * 1024 * 1024:
+                raise ValueError("El servidor está ocupado con otros archivos. Probá de nuevo en unos minutos.")
+            free = shutil.disk_usage(TMP_ROOT).free
+            if size and free < size * 1.25:
+                raise ValueError("No hay espacio temporal suficiente en el servidor.")
+
             target = workdir / orig_name
             started = time.monotonic()
             downloaded = await bot.download_media(
@@ -710,6 +800,7 @@ async def prepare_pdf_preview(user_id: int, pdf_message: Message):
             "orig_name": orig_name,
             "thumbnail": thumb_path,
             "thumb_source": thumb_source,
+            "ready_at": time.monotonic(),
         }
         try:
             await status.delete()
@@ -748,7 +839,7 @@ async def prepare_pdf_preview(user_id: int, pdf_message: Message):
         )
     finally:
         last_progress_edit.pop(user_id, None)
-        gc.collect()
+        release_memory()
 
 
 async def send_prepared_pdf(user_id: int, anchor_message: Message, final_name: str):
@@ -796,7 +887,7 @@ async def send_prepared_pdf(user_id: int, anchor_message: Message, final_name: s
             remove_path_tree(workdir)
         purge_user_ephemeral(user_id)
         user_states[user_id] = {"stage": "idle"}
-        gc.collect()
+        release_memory()
 
 
 def start_task(user_id: int, coroutine):
@@ -809,7 +900,7 @@ def start_task(user_id: int, coroutine):
     def cleanup(done_task):
         if active_tasks.get(user_id) is done_task:
             active_tasks.pop(user_id, None)
-        gc.collect()
+        release_memory()
 
     task.add_done_callback(cleanup)
 
@@ -1150,6 +1241,13 @@ async def media_handler(client: Client, message: Message):
             await message.reply_text("🖼️ Mandame una **imagen** para la miniatura.", reply_markup=CANCEL_KEYBOARD)
             return
 
+        if media_size(message) > THUMB_MAX_DOWNLOAD_MB * 1024 * 1024:
+            await message.reply_text(
+                f"🖼️ Esa imagen pesa demasiado. Mandame una de hasta {THUMB_MAX_DOWNLOAD_MB} MB.",
+                reply_markup=CANCEL_KEYBOARD
+            )
+            return
+
         workdir = Path(state.get("workdir") or tempfile.mkdtemp(prefix=f"preview_{uid}_", dir=TMP_ROOT))
         state["workdir"] = str(workdir)
         raw = await bot.download_media(message, file_name=str(workdir / "custom_raw"))
@@ -1163,6 +1261,7 @@ async def media_handler(client: Client, message: Message):
             state["thumbnail"] = custom_thumb
             state["thumb_source"] = "Miniatura personalizada"
             state["stage"] = "pdf_ready"
+            state["ready_at"] = time.monotonic()
             await message.reply_photo(
                 photo=custom_thumb,
                 caption=(
@@ -1174,6 +1273,7 @@ async def media_handler(client: Client, message: Message):
         except Exception as exc:
             remove_path_tree(raw)
             state["stage"] = "pdf_ready"
+            state["ready_at"] = time.monotonic()
             await message.reply_text(
                 f"❌ No pude usar esa imagen: `{md_safe(str(exc))[:300]}`",
                 reply_markup=pdf_actions_keyboard(uid)
@@ -1256,7 +1356,7 @@ async def main():
             await runner.cleanup()
         mongo_client.close()
         shutil.rmtree(TMP_ROOT, ignore_errors=True)
-        gc.collect()
+        release_memory()
 
 
 WELCOME_IMAGE_B64 = ""
