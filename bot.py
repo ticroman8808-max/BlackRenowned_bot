@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import gc
+import hashlib
 import logging
 import os
 import re
@@ -46,6 +47,10 @@ TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 WELCOME_IMAGE: Path | None = None
 WELCOME_VIDEO = Path(__file__).resolve().parent / "Bienvenida.mp4"
+# file_id del video ya subido a Telegram: se reutiliza para no volver a subir el video en cada /start.
+WELCOME_FILE_ID: str | None = None
+WELCOME_SHA1: str | None = None
+WELCOME_LOCK = asyncio.Lock()
 LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET_HOURS", "-3"))))
 WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "120"))
 CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "240"))
@@ -70,6 +75,7 @@ mongo_client = MongoClient(
 db = mongo_client[DATABASE_NAME]
 users_collection = db["users"]
 history_collection = db["processing_history"]
+settings_collection = db["settings"]
 
 bot = Client(
     "BlackRenownedBot",
@@ -525,6 +531,13 @@ async def build_admin_text() -> str:
         free = format_bytes(shutil.disk_usage(TMP_ROOT).free)
     except Exception:
         free = "desconocido"
+    try:
+        traffic = await asyncio.to_thread(
+            settings_collection.find_one, {"_id": f"traffic-{month_key()}"}
+        )
+        uploaded = format_bytes(int((traffic or {}).get("uploaded_bytes", 0)))
+    except Exception:
+        uploaded = "desconocido"
     return (
         "🛡️ **Panel de administración**\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -535,6 +548,7 @@ async def build_admin_text() -> str:
         f"📄 Historial guardado: **{jobs}** (✅ {successes})\n"
         f"⚙️ En curso: **{running}**\n"
         f"💽 Espacio libre: **{free}**\n"
+        f"📤 Subido este mes: **{uploaded}**\n"
         f"⏱️ Activo hace: **{format_duration(time.time() - BOT_STARTED_AT)}**"
     )
 
@@ -557,17 +571,94 @@ def prepare_welcome_image() -> Path | None:
     return fallback if fallback.exists() else None
 
 
+def month_key() -> str:
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m")
+
+
+async def record_upload(nbytes: int):
+    """Suma los bytes subidos a Telegram este mes (solo informativo, para el panel)."""
+    if not nbytes:
+        return
+    try:
+        await asyncio.to_thread(
+            settings_collection.update_one,
+            {"_id": f"traffic-{month_key()}"},
+            {"$inc": {"uploaded_bytes": int(nbytes)}},
+            upsert=True
+        )
+    except Exception:
+        logger.warning("No se pudo registrar el tráfico subido", exc_info=True)
+
+
+def file_sha1(path: Path) -> str:
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def load_welcome_file_id():
+    """Recupera de MongoDB el file_id del video, solo si el video no cambió."""
+    global WELCOME_FILE_ID, WELCOME_SHA1
+    if not WELCOME_VIDEO.exists():
+        return
+    try:
+        WELCOME_SHA1 = await asyncio.to_thread(file_sha1, WELCOME_VIDEO)
+        doc = await asyncio.to_thread(settings_collection.find_one, {"_id": "welcome_video"})
+        if doc and doc.get("sha1") == WELCOME_SHA1 and doc.get("file_id"):
+            WELCOME_FILE_ID = doc["file_id"]
+            logger.info("Video de bienvenida: se reutiliza el archivo ya subido a Telegram.")
+    except Exception:
+        logger.warning("No se pudo recuperar el file_id del video de bienvenida", exc_info=True)
+
+
+async def remember_welcome_file_id(sent: Message):
+    global WELCOME_FILE_ID
+    file_id = getattr(getattr(sent, "video", None), "file_id", None)
+    if not file_id:
+        return
+    WELCOME_FILE_ID = file_id
+    try:
+        await asyncio.to_thread(
+            settings_collection.update_one,
+            {"_id": "welcome_video"},
+            {"$set": {"file_id": file_id, "sha1": WELCOME_SHA1}},
+            upsert=True
+        )
+    except Exception:
+        logger.warning("No se pudo guardar el file_id del video de bienvenida", exc_info=True)
+
+
 async def send_welcome(message: Message, user_id: int):
+    """Envía primero el video de bienvenida y conserva la imagen como alternativa."""
+    global WELCOME_FILE_ID
     if WELCOME_VIDEO.exists():
-        try:
-            await message.reply_video(
-                video=str(WELCOME_VIDEO),
-                caption=WELCOME_TEXT,
-                reply_markup=main_keyboard(user_id)
-            )
-            return
-        except Exception:
-            logger.warning("No se pudo enviar el video de bienvenida", exc_info=True)
+        async with WELCOME_LOCK:
+            # 1) Reutilizar el video que ya está en Telegram: no gasta ancho de banda.
+            if WELCOME_FILE_ID:
+                try:
+                    await message.reply_video(
+                        video=WELCOME_FILE_ID,
+                        caption=WELCOME_TEXT,
+                        reply_markup=main_keyboard(user_id)
+                    )
+                    return
+                except Exception:
+                    logger.warning("El file_id del video ya no sirve; se vuelve a subir", exc_info=True)
+                    WELCOME_FILE_ID = None
+            # 2) Primera vez (o video nuevo): subirlo desde el disco y recordar su file_id.
+            try:
+                sent = await message.reply_video(
+                    video=str(WELCOME_VIDEO),
+                    caption=WELCOME_TEXT,
+                    reply_markup=main_keyboard(user_id)
+                )
+                await record_upload(WELCOME_VIDEO.stat().st_size)
+                await remember_welcome_file_id(sent)
+                return
+            except Exception:
+                logger.warning("No se pudo enviar el video de bienvenida", exc_info=True)
     if WELCOME_IMAGE and WELCOME_IMAGE.exists():
         try:
             await message.reply_photo(
@@ -666,6 +757,7 @@ async def send_pdf_with_thumb(
                 progress=update_progress,
                 progress_args=(status, user_id, "📤 **Subiendo PDF con miniatura**", actual_name, started)
             )
+            await record_upload(os.path.getsize(str(downloaded)))
             await save_history(user_id, actual_name, size, "success")
             await safe_edit(
                 status,
@@ -1247,7 +1339,7 @@ async def start_http_server():
     app_web.router.add_get("/health", health)
     runner = web.AppRunner(app_web)
     await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT") or os.getenv("SERVER_PORT") or "10000")
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     return runner
@@ -1274,7 +1366,13 @@ async def main():
         }}
     )
 
-    runner = await start_http_server()
+    await load_welcome_file_id()
+
+    runner = None
+    try:
+        runner = await start_http_server()
+    except Exception:
+        logger.warning("No se pudo abrir el servidor HTTP de salud; el bot sigue sin él.", exc_info=True)
     await bot.start()
     watchdog_task = asyncio.create_task(watchdog())
     cleaner_task = asyncio.create_task(auto_cleaner_loop())
@@ -1284,7 +1382,8 @@ async def main():
         cleaner_task.cancel()
         watchdog_task.cancel()
         await bot.stop()
-        await runner.cleanup()
+        if runner:
+            await runner.cleanup()
         mongo_client.close()
         shutil.rmtree(TMP_ROOT, ignore_errors=True)
         gc.collect()
