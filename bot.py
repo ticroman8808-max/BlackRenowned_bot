@@ -1,6 +1,6 @@
 import asyncio
-import ctypes
 import base64
+import ctypes
 import gc
 import hashlib
 import io
@@ -48,18 +48,22 @@ MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 TMP_ROOT = Path(os.getenv("TMP_DIR", "/tmp/blackrenowned"))
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-WELCOME_IMAGE: Path | None = None
+WELCOME_IMAGE_B64 = ""
 WELCOME_VIDEO = Path(__file__).resolve().parent / "Bienvenida.mp4"
 WELCOME_FILE_ID: str | None = None
 WELCOME_SHA1: str | None = None
 WELCOME_LOCK = asyncio.Lock()
 LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET_HOURS", "-3"))))
 WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "120"))
-# Si la memoria del bot supera este valor (en MB) y nadie lo está usando, se reinicia solo. 0 = desactivado.
-AUTO_RESTART_MB = int(os.getenv("AUTO_RESTART_MB", "0"))
+
+# Reinicio automático por memoria (en MB). 0 = apagado.
+# Activado por defecto en 200 MB: se reinicia solo si supera 200 MB y nadie lo está usando.
+# No corta trabajos ni borra un PDF que alguien esté eligiendo.
+AUTO_RESTART_MB = int(os.getenv("AUTO_RESTART_MB", "200"))
+
 CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "180"))
 MAX_TEMP_AGE_SECONDS = int(os.getenv("MAX_TEMP_AGE_SECONDS", "240"))
-# Tope de lo que pueden ocupar los temporales a la vez (los 512 MB del hosting incluyen librerías y código).
+# Tope de lo que pueden ocupar los archivos temporales en disco a la vez.
 TEMP_BUDGET_MB = int(os.getenv("TEMP_BUDGET_MB", "250"))
 # Un PDF esperando que elijas nombre/miniatura se borra solo pasado este tiempo.
 PREVIEW_TTL_SECONDS = int(os.getenv("PREVIEW_TTL_SECONDS", "1200"))
@@ -320,20 +324,21 @@ def clear_state_files(state: dict):
             remove_path_tree(val)
 
 
-def purge_user_ephemeral(user_id: int):
+def purge_user_ephemeral(user_id: int, trim_mem: bool = True):
     last_progress_edit.pop(user_id, None)
     state = user_states.get(user_id)
     if state:
         clear_state_files(state)
         state.clear()
-    release_memory()
+    if trim_mem:
+        release_memory()
 
 
-def reset_state(user_id: int):
+def reset_state(user_id: int, trim_mem: bool = True):
     state = user_states.get(user_id, {})
     if state.get("stage") != "processing":
         clear_state_files(state)
-    purge_user_ephemeral(user_id)
+    purge_user_ephemeral(user_id, trim_mem=trim_mem)
     user_states[user_id] = {"stage": "idle"}
 
 
@@ -539,12 +544,20 @@ async def record_upload(nbytes: int):
         logger.warning("No se pudo registrar el tráfico subido", exc_info=True)
 
 
+def auto_restart_summary() -> str:
+    if AUTO_RESTART_MB > 0:
+        return f"Activo (límite: **{AUTO_RESTART_MB} MB**, solo si nadie lo está usando)"
+    return "Apagado (`AUTO_RESTART_MB=0`)"
+
+
 async def build_admin_text() -> str:
     users = await asyncio.to_thread(users_collection.count_documents, {})
     pending = await asyncio.to_thread(users_collection.count_documents, {"access_status": "pending"})
     allowed = await asyncio.to_thread(users_collection.count_documents, {"access_status": "approved"})
     blocked = await asyncio.to_thread(users_collection.count_documents, {"access_status": {"$in": ["rejected", "revoked"]}})
     running = sum(1 for task in active_tasks.values() if not task.done())
+    rss = current_rss_mb()
+    rss_text = f"{rss} MB" if rss else "desconocido"
     try:
         free = format_bytes(shutil.disk_usage(TMP_ROOT).free)
     except Exception:
@@ -562,6 +575,9 @@ async def build_admin_text() -> str:
         "🛡️ **Panel de administración**\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"⚙️ Estado: **{modo_bot}**\n"
+        f"🧠 Memoria actual: **{rss_text}**\n"
+        f"♻️ Reinicio aut. por memoria: **{auto_restart_summary()}**\n"
+        f"📦 Tope PDF / Temp: **{MAX_FILE_SIZE_MB} MB / {TEMP_BUDGET_MB} MB**\n"
         f"👥 Usuarios: **{users}**\n"
         f"📨 Pendientes: **{pending}**\n"
         f"✅ Permitidos: **{allowed}**\n"
@@ -691,7 +707,6 @@ _BYTES_PER_PIXEL = {"1": 4, "L": 1, "P": 4, "RGB": 3, "LA": 4, "RGBA": 4}
 
 def _save_jpeg_thumb(pil_img: Image.Image, destination: str) -> str:
     if pil_img.format == "JPEG":
-        # Decodifica el JPG directamente a escala reducida: ahorra muchísima memoria.
         pil_img.draft("RGB", (640, 640))
     else:
         has_alpha = pil_img.mode in ("RGBA", "LA", "PA") or "transparency" in pil_img.info
@@ -726,7 +741,7 @@ async def extract_first_pdf_image_thumb(pdf_path: str, destination: str) -> tupl
     Si la 1.ª página no contiene imágenes incrustadas, renderiza la 1.ª página como respaldo.
     """
     def extract():
-        import fitz  # PyMuPDF (se carga solo cuando hace falta)
+        import fitz
         doc = fitz.open(pdf_path)
         try:
             if len(doc) == 0:
@@ -736,11 +751,12 @@ async def extract_first_pdf_image_thumb(pdf_path: str, destination: str) -> tupl
             if imgs:
                 try:
                     base = doc.extract_image(imgs[0][0])
-                    with Image.open(io.BytesIO(base["image"])) as img:
-                        _save_jpeg_thumb(img, destination)
-                    return destination, "1.ª imagen del PDF"
+                    raw_bytes = base.get("image") or b""
+                    if len(raw_bytes) <= MAX_THUMB_SOURCE_MB * 1024 * 1024:
+                        with Image.open(io.BytesIO(raw_bytes)) as img:
+                            _save_jpeg_thumb(img, destination)
+                        return destination, "1.ª imagen del PDF"
                 except Exception as exc:
-                    # Imagen ilegible o demasiado grande: se usa la página renderizada como respaldo.
                     logger.info("No se pudo usar la 1.ª imagen del PDF (%s); se usa la página", exc)
             longest = max(page.rect.width, page.rect.height) or 1
             zoom = min(100 / 72, 1000 / longest)
@@ -828,12 +844,12 @@ async def prepare_pdf_preview(user_id: int, pdf_message: Message):
             )
     except asyncio.CancelledError:
         shutil.rmtree(workdir, ignore_errors=True)
-        reset_state(user_id)
+        reset_state(user_id, trim_mem=False)
         await safe_edit(status, "🛑 **Operación detenida.**", reply_markup=HOME_KEYBOARD)
         raise
     except Exception as exc:
         shutil.rmtree(workdir, ignore_errors=True)
-        reset_state(user_id)
+        reset_state(user_id, trim_mem=False)
         logger.exception("Error preparando vista previa para user_id=%s", user_id)
         await safe_edit(
             status,
@@ -888,7 +904,7 @@ async def send_prepared_pdf(user_id: int, anchor_message: Message, final_name: s
     finally:
         if workdir:
             remove_path_tree(workdir)
-        purge_user_ephemeral(user_id)
+        purge_user_ephemeral(user_id, trim_mem=False)
         user_states[user_id] = {"stage": "idle"}
         release_memory()
 
@@ -912,7 +928,7 @@ def start_task(user_id: int, coroutine):
 # VIGILANCIA Y REINICIO
 # ============================================================
 def restart_process(reason: str):
-    """Reinicia el bot dentro del mismo proceso: así HOKAS no lo da por caído y no hace falta prenderlo a mano."""
+    """Reinicia el bot dentro del mismo proceso para mantener estable el contenedor."""
     logger.warning("Reiniciando el bot. Motivo: %s", reason)
     try:
         shutil.rmtree(TMP_ROOT, ignore_errors=True)
@@ -939,6 +955,8 @@ def current_rss_mb() -> int:
 
 
 def bot_is_idle() -> bool:
+    if PROCESS_SEMAPHORE.locked():
+        return False
     if any(not task.done() for task in active_tasks.values()):
         return False
     return all(st.get("stage", "idle") == "idle" for st in user_states.values())
@@ -948,10 +966,10 @@ async def watchdog():
     failures = 0
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL)
-        if AUTO_RESTART_MB and bot_is_idle():
+        if AUTO_RESTART_MB > 0 and bot_is_idle():
             rss = current_rss_mb()
             if rss > AUTO_RESTART_MB:
-                restart_process(f"memoria alta ({rss} MB) sin trabajos en curso")
+                restart_process(f"memoria ({rss} MB) por encima de AUTO_RESTART_MB ({AUTO_RESTART_MB} MB) sin trabajos ni PDFs pendientes")
         if any(not task.done() for task in active_tasks.values()):
             failures = 0
             continue
@@ -1288,6 +1306,8 @@ async def media_handler(client: Client, message: Message):
         raw = await bot.download_media(message, file_name=str(workdir / "custom_raw"))
         custom_thumb = str(workdir / "custom_thumb.jpg")
         try:
+            if not raw or not os.path.isfile(raw):
+                raise RuntimeError("No se pudo descargar la imagen.")
             await make_thumbnail_jpeg(raw, custom_thumb)
             remove_path_tree(raw)
             old_thumb = state.get("thumbnail")
@@ -1306,13 +1326,16 @@ async def media_handler(client: Client, message: Message):
                 reply_markup=pdf_actions_keyboard(uid)
             )
         except Exception as exc:
-            remove_path_tree(raw)
+            if raw:
+                remove_path_tree(raw)
             state["stage"] = "pdf_ready"
             state["ready_at"] = time.monotonic()
             await message.reply_text(
                 f"❌ No pude usar esa imagen: `{md_safe(str(exc))[:300]}`",
                 reply_markup=pdf_actions_keyboard(uid)
             )
+        finally:
+            release_memory()
         return
 
     if not is_pdf_message(message):
@@ -1348,6 +1371,9 @@ async def start_http_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     return runner
+
+
+WELCOME_IMAGE = prepare_welcome_image()
 
 
 async def main():
@@ -1392,10 +1418,6 @@ async def main():
         mongo_client.close()
         shutil.rmtree(TMP_ROOT, ignore_errors=True)
         release_memory()
-
-
-WELCOME_IMAGE_B64 = ""
-WELCOME_IMAGE = prepare_welcome_image()
 
 
 if __name__ == "__main__":
