@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,8 @@ WELCOME_SHA1: str | None = None
 WELCOME_LOCK = asyncio.Lock()
 LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("TZ_OFFSET_HOURS", "-3"))))
 WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "120"))
+# Si la memoria del bot supera este valor (en MB) y nadie lo está usando, se reinicia solo. 0 = desactivado.
+AUTO_RESTART_MB = int(os.getenv("AUTO_RESTART_MB", "0"))
 CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "180"))
 MAX_TEMP_AGE_SECONDS = int(os.getenv("MAX_TEMP_AGE_SECONDS", "240"))
 # Tope de lo que pueden ocupar los temporales a la vez (los 512 MB del hosting incluyen librerías y código).
@@ -909,14 +912,46 @@ def start_task(user_id: int, coroutine):
 # VIGILANCIA Y REINICIO
 # ============================================================
 def restart_process(reason: str):
+    """Reinicia el bot dentro del mismo proceso: así HOKAS no lo da por caído y no hace falta prenderlo a mano."""
     logger.warning("Reiniciando el bot. Motivo: %s", reason)
-    os._exit(1)
+    try:
+        shutil.rmtree(TMP_ROOT, ignore_errors=True)
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception:
+        logger.exception("No se pudo reiniciar en el mismo proceso; se cierra el proceso")
+        os._exit(1)
+
+
+def current_rss_mb() -> int:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def bot_is_idle() -> bool:
+    if any(not task.done() for task in active_tasks.values()):
+        return False
+    return all(st.get("stage", "idle") == "idle" for st in user_states.values())
 
 
 async def watchdog():
     failures = 0
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL)
+        if AUTO_RESTART_MB and bot_is_idle():
+            rss = current_rss_mb()
+            if rss > AUTO_RESTART_MB:
+                restart_process(f"memoria alta ({rss} MB) sin trabajos en curso")
         if any(not task.done() for task in active_tasks.values()):
             failures = 0
             continue
